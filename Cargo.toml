@@ -1,0 +1,34 @@
+[package]
+name = "grib2pmtiles"
+version = "0.1.0"
+edition = "2024"
+description = "Convert JMA GRIB2 grid products directly to layered PMTiles archives"
+repository = "https://github.com/MIERUNE/grib2pmtiles"
+publish = false
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+flate2 = "1.1.9"
+fast_hilbert = "2.1.0"
+foldhash = "0.2.0"
+gpv-products = { path = "crates/gpv-products" }
+i_overlay = { version = "7.0.0", features = ["allow_multithreading"] }
+indexmap = "2.14.0"
+itertools = "0.14.0"
+pmtiles = { version = "0.23", default-features = false, features = ["write"] }
+prost = "0.14.4"
+rayon = "1.12.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tinygrib2 = { git = "https://github.com/MIERUNE/tinygrib2.git", rev = "37f4ee2bca4205bf08a645be9378af1bc56ec705" }
+tinymvt = "0.3.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
