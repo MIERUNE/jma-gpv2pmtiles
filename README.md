@@ -1,6 +1,6 @@
 # jma-gpv2pmtiles
 
-気象庁のGPVデータ (GRIB2形式) を直接 PMTiles アーカイブに変換します。
+気象庁のGPVデータ (GRIB2形式) を直接 PMTiles アーカイブに変換するデモです。
 
 `jma-gpv2pmtiles` directly converts GPV data provided by the Japan Meteorological Agency (JMA) in GRIB2 format into PMTiles archives.
 
