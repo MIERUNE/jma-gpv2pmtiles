@@ -3,7 +3,9 @@ mod mvt;
 use gpv_products::model::Aggregation;
 use itertools::Itertools;
 use rayon::prelude::*;
-use tinymvt::{vector_tile::tile::Layer, webmercator::web_mercator_to_lnglat};
+use tinymvt::{
+    tag::Value as TagValue, vector_tile::tile::Layer, webmercator::web_mercator_to_lnglat,
+};
 
 use crate::{
     geo::{LngLat, LngLatBox},
@@ -67,6 +69,32 @@ struct BandScale<'a> {
     reference: f32,
     binary_scale: f32,
     decimal_scale: f64,
+}
+
+impl BandScale<'_> {
+    /// Converts a raw band value into an MVT attribute value.
+    ///
+    /// The MVT value type is chosen from the band spec alone, never from the
+    /// value: a scaled band always yields `float`, an unscaled one always
+    /// yields `sint`. Mixing types within a single attribute is legal in MVT,
+    /// but consumers that give each attribute one column type - MapLibre Tiles
+    /// among them - cannot represent it, and can drop or corrupt the values.
+    /// Since `scaling` is derived from the band spec, the type stays the same
+    /// across every feature, tile and zoom level of a layer.
+    ///
+    /// Note that `TagValue::from` must not be used for the integer case: it
+    /// picks `uint` or `sint` depending on the sign, so a band spanning zero
+    /// would mix both.
+    #[inline]
+    fn tag_value(&self, value: i32) -> TagValue {
+        if self.scaling {
+            let v =
+                (self.reference + (value as f32) * self.binary_scale) as f64 * self.decimal_scale;
+            TagValue::from(v as f32)
+        } else {
+            TagValue::SInt(value as i64)
+        }
+    }
 }
 
 #[inline]
@@ -300,6 +328,34 @@ mod tests {
 
     fn value(value: i32) -> CompactOptI32 {
         CompactOptI32::new(Some(value))
+    }
+
+    fn band(scaling: bool, decimal_scale: f64) -> BandScale<'static> {
+        BandScale {
+            name: "value",
+            scaling,
+            reference: 0.0,
+            binary_scale: 1.0,
+            decimal_scale,
+        }
+    }
+
+    #[test]
+    fn scaled_band_emits_float_even_when_the_value_is_integral() {
+        let band = band(true, 0.1);
+
+        // 1.0 and 1.5 must land in the same column type.
+        assert_eq!(band.tag_value(10), TagValue::from(1.0f32));
+        assert_eq!(band.tag_value(15), TagValue::from(1.5f32));
+    }
+
+    #[test]
+    fn unscaled_band_emits_sint_on_both_sides_of_zero() {
+        let band = band(false, 1.0);
+
+        assert_eq!(band.tag_value(-3), TagValue::SInt(-3));
+        assert_eq!(band.tag_value(0), TagValue::SInt(0));
+        assert_eq!(band.tag_value(7), TagValue::SInt(7));
     }
 
     #[test]

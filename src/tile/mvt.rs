@@ -69,16 +69,7 @@ pub(super) fn render_mvt_layer(
             let Some(value) = raw_value.get() else {
                 continue;
             };
-            if band.scaling {
-                let v = (band.reference + (value as f32) * band.binary_scale) as f64
-                    * band.decimal_scale;
-                match v.fract() {
-                    0.0 => tags_enc.add(band.name, v as i32),
-                    _ => tags_enc.add(band.name, v as f32),
-                };
-            } else {
-                tags_enc.add(band.name, value);
-            }
+            tags_enc.add(band.name, band.tag_value(value));
         }
 
         let feat_id = match tileset_spec.band_specs.len() {

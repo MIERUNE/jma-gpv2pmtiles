@@ -1,10 +1,10 @@
 # jma-gpv2pmtiles
 
-気象庁のGPVデータ (GRIB2形式) を直接 PMTiles アーカイブに変換するデモです。
+気象庁のGPVデータ (GRIB2形式) を直接ベクタータイル (PMTilesアーカイブ) に変換するデモです。
 
 `jma-gpv2pmtiles` directly converts GPV data provided by the Japan Meteorological Agency (JMA) in GRIB2 format into PMTiles archives.
 
-LICENSE: Apache-2 or MIT
+LICENSE: [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE)
 
 ## 使い方
 
