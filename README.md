@@ -4,6 +4,8 @@
 
 `jma-gpv2pmtiles` directly converts GPV data provided by the Japan Meteorological Agency (JMA) in GRIB2 format into PMTiles archives.
 
+LICENSE: Apache-2 or MIT
+
 ## 使い方
 
 ```bash
