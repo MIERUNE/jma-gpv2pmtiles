@@ -149,6 +149,7 @@ fn prepare_product(
         base_z,
         grid_spec: product_id.grid().clone(),
         aggregation: product_id.aggregation(),
+        quantize: vec![None; product_data.band_specs.len()],
         band_specs: product_data.band_specs,
         bounds: [min_lng, min_lat, max_lng, max_lat],
     };

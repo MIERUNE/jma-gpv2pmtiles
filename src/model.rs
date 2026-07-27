@@ -3,6 +3,8 @@ use gpv_products::{
     products::GpvProductIdentifier,
 };
 
+use crate::quantize::BandQuantize;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct CompactOptI32(i32);
 
@@ -88,6 +90,8 @@ pub(crate) struct TilesetSpec {
     pub grid_spec: LngLatGrid,
     pub aggregation: Aggregation,
     pub band_specs: Vec<BandSpec>,
+    /// Optional quantization per band, in `band_specs` order.
+    pub quantize: Vec<Option<BandQuantize>>,
     pub bounds: [f64; 4],
 }
 

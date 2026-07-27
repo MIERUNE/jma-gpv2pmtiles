@@ -16,7 +16,7 @@ use tracing::info;
 use crate::{
     metadata,
     model::PreparedProduct,
-    prepare,
+    prepare, quantize,
     tile::{TileContext, Zxy, make_layer, zxy_to_chunk_id_range},
 };
 
@@ -27,6 +27,8 @@ pub struct ConvertOptions {
     pub layer_count: Option<usize>,
     pub min_zoom: u8,
     pub max_zoom: Option<u8>,
+    /// One `--quantize` specification per band; see [`crate::quantize`].
+    pub quantize: Vec<String>,
 }
 
 impl Default for ConvertOptions {
@@ -37,6 +39,7 @@ impl Default for ConvertOptions {
             layer_count: None,
             min_zoom: 0,
             max_zoom: None,
+            quantize: Vec::new(),
         }
     }
 }
@@ -44,7 +47,7 @@ impl Default for ConvertOptions {
 pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<()> {
     validate_options(options)?;
     info!(input = %input.display(), "parsing GRIB2");
-    let products = select_products(
+    let mut products = select_products(
         prepare::read_products(input)?,
         options.product.as_deref(),
         options.layer_count,
@@ -58,6 +61,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         .collect::<Vec<_>>();
 
     ensure_compatible_products(&products)?;
+    apply_quantization(&mut products, &options.quantize)?;
     let max_zoom = options.max_zoom.unwrap_or_else(|| {
         products
             .iter()
@@ -195,6 +199,34 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     );
     if let Some(layer_count) = options.layer_count {
         ensure!(layer_count > 0, "layer count must be greater than zero");
+    }
+    quantize::validate_syntax(&options.quantize)?;
+    Ok(())
+}
+
+/// Resolves `--quantize` once and shares it with every layer.
+///
+/// `ensure_compatible_products` has already established that the products agree
+/// on their bands, so a single resolution applies to all of them.
+fn apply_quantization(products: &mut [PreparedProduct], args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    let Some(first) = products.first() else {
+        return Ok(());
+    };
+    let resolved = quantize::resolve(args, &first.spec.band_specs)?;
+    for (band, quantize) in first.spec.band_specs.iter().zip(&resolved) {
+        if let Some(quantize) = quantize {
+            info!(
+                band = %band.name,
+                classes = quantize.outputs().len(),
+                "quantizing values"
+            );
+        }
+    }
+    for product in products {
+        product.spec.quantize = resolved.clone();
     }
     Ok(())
 }

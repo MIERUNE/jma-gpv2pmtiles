@@ -11,6 +11,7 @@ use crate::{
     geo::{LngLat, LngLatBox},
     hilbert::{hilbert_to_xy, xy_to_hilbert},
     model::{CompactOptI32, PreparedProduct},
+    quantize::BandQuantize,
 };
 
 pub(crate) type Zxy = (u8, u32, u32);
@@ -66,31 +67,48 @@ struct Point {
 struct BandScale<'a> {
     name: &'a str,
     scaling: bool,
-    reference: f32,
-    binary_scale: f32,
+    reference: f64,
+    binary_scale: f64,
     decimal_scale: f64,
+    /// When set, the incoming value is a class index rather than a raw value.
+    quantize: Option<&'a BandQuantize>,
 }
 
 impl BandScale<'_> {
     /// Converts a raw band value into an MVT attribute value.
     ///
     /// The MVT value type is chosen from the band spec alone, never from the
-    /// value: a scaled band always yields `float`, an unscaled one always
+    /// value: a scaled band always yields `double`, an unscaled one always
     /// yields `sint`. Mixing types within a single attribute is legal in MVT,
     /// but consumers that give each attribute one column type - MapLibre Tiles
     /// among them - cannot represent it, and can drop or corrupt the values.
     /// Since `scaling` is derived from the band spec, the type stays the same
     /// across every feature, tile and zoom level of a layer.
     ///
+    /// The scaling is computed in `f64` and emitted as `double` so that the
+    /// whole `i32` range of raw values survives: `f32` only holds integers
+    /// exactly up to 2^24, and an `i32` output would instead saturate once the
+    /// scaled value leaves the `i32` range.
+    ///
     /// Note that `TagValue::from` must not be used for the integer case: it
     /// picks `uint` or `sint` depending on the sign, so a band spanning zero
     /// would mix both.
     #[inline]
     fn tag_value(&self, value: i32) -> TagValue {
+        if let Some(quantize) = self.quantize {
+            // `value` is a class index here; the scaling was already applied
+            // when the boundaries were resolved.
+            let output = quantize.output(value);
+            return if quantize.integral_outputs() {
+                TagValue::SInt(output as i64)
+            } else {
+                TagValue::from(output)
+            };
+        }
         if self.scaling {
-            let v =
-                (self.reference + (value as f32) * self.binary_scale) as f64 * self.decimal_scale;
-            TagValue::from(v as f32)
+            TagValue::from(
+                (self.reference + (value as f64) * self.binary_scale) * self.decimal_scale,
+            )
         } else {
             TagValue::SInt(value as i64)
         }
@@ -297,17 +315,35 @@ pub(crate) fn make_layer(
         }
     }
 
+    // Quantize before the polygons are grouped, so that cells sharing a class
+    // merge into a single polygon. Doing it while encoding attributes would
+    // leave the geometry fragmented, which is where most of a tile's bytes are.
+    // It has to run after aggregation, or averages would be taken over values
+    // that were already coarsened.
+    if product.spec.quantize.iter().any(Option::is_some) {
+        for point in points.values_mut() {
+            for (index, quantize) in product.spec.quantize.iter().enumerate() {
+                if let Some(quantize) = quantize {
+                    point.values[index] = point.values[index]
+                        .map(|value| CompactOptI32::new(Some(quantize.class_of(value))));
+                }
+            }
+        }
+    }
+
     let band_scales = product
         .spec
         .band_specs
         .iter()
-        .map(|band| BandScale {
+        .zip(&product.spec.quantize)
+        .map(|(band, quantize)| BandScale {
             name: &band.name,
+            quantize: quantize.as_ref(),
             scaling: band.binary_scale != 0
                 || band.reference_value != 0.0
                 || band.decimal_scale != 0,
-            reference: band.reference_value,
-            binary_scale: 2f32.powi(band.binary_scale as i32),
+            reference: band.reference_value as f64,
+            binary_scale: 2f64.powi(band.binary_scale as i32),
             decimal_scale: 10f64.powi(-band.decimal_scale as i32),
         })
         .collect_vec();
@@ -337,16 +373,83 @@ mod tests {
             reference: 0.0,
             binary_scale: 1.0,
             decimal_scale,
+            quantize: None,
         }
     }
 
     #[test]
-    fn scaled_band_emits_float_even_when_the_value_is_integral() {
+    fn scaled_band_emits_double_even_when_the_value_is_integral() {
         let band = band(true, 0.1);
 
         // 1.0 and 1.5 must land in the same column type.
-        assert_eq!(band.tag_value(10), TagValue::from(1.0f32));
-        assert_eq!(band.tag_value(15), TagValue::from(1.5f32));
+        assert_eq!(band.tag_value(10), TagValue::from(1.0f64));
+        assert_eq!(band.tag_value(15), TagValue::from(1.5f64));
+    }
+
+    #[test]
+    fn scaled_band_keeps_values_beyond_the_f32_integer_range() {
+        let band = band(true, 1.0);
+
+        // 2^24 is where f32 stops holding consecutive integers, and i32 would
+        // saturate above 2^31.
+        assert_eq!(band.tag_value(33_554_450), TagValue::from(33_554_450.0f64));
+        assert_eq!(band.tag_value(i32::MAX), TagValue::from(2_147_483_647.0f64));
+        assert_eq!(
+            band.tag_value(-33_554_450),
+            TagValue::from(-33_554_450.0f64)
+        );
+    }
+
+    #[test]
+    fn a_quantized_band_emits_the_class_output_as_one_type() {
+        let spec = gpv_products::model::BandSpec {
+            name: "value".to_string(),
+            ..Default::default()
+        };
+        let quantize = crate::quantize::resolve(&["0,1,2".to_string()], &[spec])
+            .unwrap()
+            .pop()
+            .flatten()
+            .unwrap();
+        let band = BandScale {
+            name: "value",
+            scaling: true,
+            reference: 0.0,
+            binary_scale: 1.0,
+            decimal_scale: 0.1,
+            quantize: Some(&quantize),
+        };
+
+        // Integral outputs collapse the column to sint, and the value passed in
+        // is a class index rather than a raw value.
+        assert_eq!(band.tag_value(0), TagValue::SInt(0));
+        assert_eq!(band.tag_value(1), TagValue::SInt(1));
+        assert_eq!(band.tag_value(2), TagValue::SInt(2));
+    }
+
+    #[test]
+    fn a_quantized_band_with_fractional_outputs_stays_double() {
+        let spec = gpv_products::model::BandSpec {
+            name: "value".to_string(),
+            ..Default::default()
+        };
+        let quantize = crate::quantize::resolve(&["0:0,1:0.5,2:1.5".to_string()], &[spec])
+            .unwrap()
+            .pop()
+            .flatten()
+            .unwrap();
+        let band = BandScale {
+            name: "value",
+            scaling: true,
+            reference: 0.0,
+            binary_scale: 1.0,
+            decimal_scale: 0.1,
+            quantize: Some(&quantize),
+        };
+
+        assert_eq!(band.tag_value(0), TagValue::from(0.0f64));
+        assert_eq!(band.tag_value(1), TagValue::from(0.5f64));
+        assert_eq!(band.tag_value(2), TagValue::from(1.5f64));
     }
 
     #[test]

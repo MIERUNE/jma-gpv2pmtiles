@@ -37,6 +37,30 @@ pub(crate) fn generate_metadata(
         })
         .collect::<Vec<_>>();
 
+    // Quantization is lossy, so record it: the values are class representatives,
+    // which a consumer cannot tell apart from measurements otherwise.
+    let quantization = products
+        .first()
+        .map(|product| {
+            product
+                .spec
+                .band_specs
+                .iter()
+                .zip(&product.spec.quantize)
+                .filter_map(|(band, quantize)| {
+                    let quantize = quantize.as_ref()?;
+                    Some((
+                        band.name.clone(),
+                        json!({
+                            "bounds": quantize.bounds(),
+                            "outputs": quantize.outputs(),
+                        }),
+                    ))
+                })
+                .collect::<Map<String, Value>>()
+        })
+        .unwrap_or_default();
+
     let mut metadata = Map::new();
     metadata.insert("name".into(), json!(archive_name));
     metadata.insert("description".into(), json!(""));
@@ -48,5 +72,8 @@ pub(crate) fn generate_metadata(
     metadata.insert("maxzoom".into(), json!(max_zoom));
     metadata.insert("bounds".into(), json!(bounds));
     metadata.insert("vector_layers".into(), json!(vector_layers));
+    if !quantization.is_empty() {
+        metadata.insert("quantization".into(), Value::Object(quantization));
+    }
     metadata
 }

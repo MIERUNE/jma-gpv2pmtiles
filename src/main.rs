@@ -32,6 +32,18 @@ struct Cli {
     /// Maximum output zoom. By default it is derived from the source grid.
     #[arg(long)]
     max_zoom: Option<u8>,
+
+    /// Quantize values into classes before building polygons, which merges
+    /// neighbouring cells and shrinks the geometry.
+    ///
+    /// Boundaries are inclusive lower bounds in physical units, optionally
+    /// followed by the value the class should emit: --quantize "0,1,2,4,8" or
+    /// --quantize "0:0,1:0.5,2:1.5". The last class is open ended, and values
+    /// below the first boundary join the first class. Prefix with a band name
+    /// and repeat the option when the product has several bands, such as
+    /// --quantize "u=-50,0,50".
+    #[arg(long, value_name = "SPEC")]
+    quantize: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -46,6 +58,7 @@ fn main() -> Result<()> {
             layer_count: cli.layer_count,
             min_zoom: cli.min_zoom,
             max_zoom: cli.max_zoom,
+            quantize: cli.quantize,
         },
     )
 }
