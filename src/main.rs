@@ -25,6 +25,12 @@ struct Cli {
     #[arg(long)]
     layer_count: Option<usize>,
 
+    /// First number substituted for {seq}, so the numbering can match the
+    /// forecast hours of the input. For example --layer-seq-start 1 turns an
+    /// FH01-06 input into layers 1 through 6.
+    #[arg(long, default_value_t = 0)]
+    layer_seq_start: usize,
+
     /// Minimum output zoom.
     #[arg(long, default_value_t = 0)]
     min_zoom: u8,
@@ -32,6 +38,24 @@ struct Cli {
     /// Maximum output zoom. By default it is derived from the source grid.
     #[arg(long)]
     max_zoom: Option<u8>,
+
+    /// Drop products that are analyses rather than forecasts. Nowcast inputs
+    /// lead with the observed field, whose valid time is before the reference
+    /// time, which otherwise becomes the first layer.
+    #[arg(long)]
+    skip_analysis: bool,
+
+    /// Keep only products at least this many minutes ahead of the reference
+    /// time. The first nowcast step is valid at the reference time itself, so
+    /// --min-lead-time 5 starts the layers at the first real forecast.
+    #[arg(long, value_name = "MINUTES")]
+    min_lead_time: Option<i64>,
+
+    /// Rename a band as <FROM>=<TO>, such as --rename value=DN. The name is
+    /// used as the MVT attribute key and the metadata field name, and
+    /// --quantize refers to the new name. Repeat for several bands.
+    #[arg(long, value_name = "FROM=TO")]
+    rename: Vec<String>,
 
     /// Quantize values into classes before building polygons, which merges
     /// neighbouring cells and shrinks the geometry.
@@ -44,6 +68,19 @@ struct Cli {
     /// --quantize "u=-50,0,50".
     #[arg(long, value_name = "SPEC")]
     quantize: Vec<String>,
+
+    /// Leave cells with these values out of the tile entirely, geometry
+    /// included. Values are in physical units, or the class value when
+    /// --quantize is used. Prefix with a band name when the product has several
+    /// bands, and repeat the option as needed.
+    #[arg(long, value_name = "VALUES")]
+    omit: Vec<String>,
+
+    /// Leave cells whose value is zero out of the tile, on every band. A
+    /// shorthand for --omit 0 that is simply ignored by bands which cannot
+    /// produce a zero.
+    #[arg(long)]
+    omit_zero: bool,
 }
 
 fn main() -> Result<()> {
@@ -58,7 +95,13 @@ fn main() -> Result<()> {
             layer_count: cli.layer_count,
             min_zoom: cli.min_zoom,
             max_zoom: cli.max_zoom,
+            layer_seq_start: cli.layer_seq_start,
+            rename: cli.rename,
             quantize: cli.quantize,
+            omit: cli.omit,
+            omit_zero: cli.omit_zero,
+            skip_analysis: cli.skip_analysis,
+            min_lead_time: cli.min_lead_time,
         },
     )
 }

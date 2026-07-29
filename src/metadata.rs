@@ -47,13 +47,15 @@ pub(crate) fn generate_metadata(
                 .band_specs
                 .iter()
                 .zip(&product.spec.quantize)
-                .filter_map(|(band, quantize)| {
+                .zip(&product.spec.omit)
+                .filter_map(|((band, quantize), omit)| {
                     let quantize = quantize.as_ref()?;
                     Some((
                         band.name.clone(),
                         json!({
                             "bounds": quantize.bounds(),
                             "outputs": quantize.outputs(),
+                            "omitted": omit.as_ref().map(|omit| omit.physical()).unwrap_or(&[]),
                         }),
                     ))
                 })

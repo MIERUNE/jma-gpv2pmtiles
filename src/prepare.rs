@@ -150,6 +150,7 @@ fn prepare_product(
         grid_spec: product_id.grid().clone(),
         aggregation: product_id.aggregation(),
         quantize: vec![None; product_data.band_specs.len()],
+        omit: vec![None; product_data.band_specs.len()],
         band_specs: product_data.band_specs,
         bounds: [min_lng, min_lat, max_lng, max_lat],
     };

@@ -331,6 +331,33 @@ pub(crate) fn make_layer(
         }
     }
 
+    // Omitted values are cleared and their points dropped. Clearing alone would
+    // leave an untagged polygon behind, which defeats the purpose. This runs
+    // after quantization because a quantized point carries its class index.
+    if product.spec.omit.iter().any(Option::is_some) {
+        for point in points.values_mut() {
+            for (index, omit) in product.spec.omit.iter().enumerate() {
+                if let Some(omit) = omit {
+                    point.values[index] = point.values[index].map(|value| {
+                        if omit.contains(value) {
+                            CompactOptI32::NONE
+                        } else {
+                            CompactOptI32::new(Some(value))
+                        }
+                    });
+                }
+            }
+        }
+        points.retain(|_, point| {
+            point.values[..band_count]
+                .iter()
+                .any(|value| value.get().is_some())
+        });
+        if points.is_empty() {
+            return None;
+        }
+    }
+
     let band_scales = product
         .spec
         .band_specs
