@@ -1,21 +1,28 @@
 mod mvt;
+mod raster;
 
+pub(crate) use raster::{
+    ColorEncoding, IMAGE_EXTENT as RASTER_IMAGE_EXTENT, RangeReport,
+    TILE_BUFFER as RASTER_TILE_BUFFER, TILE_EXTENT as RASTER_TILE_EXTENT,
+};
+mod rect_union;
+
+use anyhow::Result;
+use fast_mvt::MvtValue;
 use gpv_products::model::Aggregation;
 use itertools::Itertools;
 use rayon::prelude::*;
-use tinymvt::{
-    tag::Value as TagValue, vector_tile::tile::Layer, webmercator::web_mercator_to_lnglat,
-};
+
+use fast_hilbert::xy2h;
 
 use crate::{
-    geo::{LngLat, LngLatBox},
-    hilbert::{hilbert_to_xy, xy_to_hilbert},
+    geo::{LngLat, LngLatBox, web_mercator_to_lnglat},
     model::{CompactOptI32, PreparedProduct},
-    quantize::BandQuantize,
+    quantize::{BandOmit, BandQuantize},
 };
 
 pub(crate) type Zxy = (u8, u32, u32);
-type IndexMap<K, V> = indexmap::IndexMap<K, V, foldhash::fast::RandomState>;
+type PointMap<K, V> = foldhash::HashMap<K, V>;
 
 #[derive(Debug, Clone, Copy)]
 struct TileBounds {
@@ -90,27 +97,64 @@ impl BandScale<'_> {
     /// exactly up to 2^24, and an `i32` output would instead saturate once the
     /// scaled value leaves the `i32` range.
     ///
-    /// Note that `TagValue::from` must not be used for the integer case: it
+    /// Note that `MvtValue::from` must not be used for the integer case: it
     /// picks `uint` or `sint` depending on the sign, so a band spanning zero
     /// would mix both.
+    /// Whether the band's values are class indices rather than measurements.
     #[inline]
-    fn tag_value(&self, value: i32) -> TagValue {
+    fn is_quantized(&self) -> bool {
+        self.quantize.is_some()
+    }
+
+    /// The physical value a **raw GRIB reading** ends up as in a tile.
+    ///
+    /// Quantization happens between the two, so this has to apply it rather
+    /// than skip it: [`Self::physical`] expects a value that has already been
+    /// through it and would read a raw value as a class index, indexing the
+    /// class table out of bounds.
+    #[inline]
+    fn source_physical(&self, raw: i32) -> f64 {
+        match self.quantize {
+            Some(quantize) => quantize.output(quantize.class_of(raw)),
+            None => self.physical(raw),
+        }
+    }
+
+    /// The value in the band's physical unit, as the raster encoders need it.
+    ///
+    /// Takes a **tile** value: one that has already been quantized, if the band
+    /// is quantized at all. Use [`Self::source_physical`] for a raw reading.
+    /// Mirrors the branches of [`Self::tag_value`], which chooses an MVT type
+    /// for the same number.
+    #[inline]
+    fn physical(&self, value: i32) -> f64 {
+        if let Some(quantize) = self.quantize {
+            quantize.output(value)
+        } else if self.scaling {
+            (self.reference + f64::from(value) * self.binary_scale) * self.decimal_scale
+        } else {
+            f64::from(value)
+        }
+    }
+
+    #[inline]
+    fn tag_value(&self, value: i32) -> MvtValue {
         if let Some(quantize) = self.quantize {
             // `value` is a class index here; the scaling was already applied
             // when the boundaries were resolved.
             let output = quantize.output(value);
             return if quantize.integral_outputs() {
-                TagValue::SInt(output as i64)
+                MvtValue::SInt(output as i64)
             } else {
-                TagValue::from(output)
+                MvtValue::Double(output)
             };
         }
         if self.scaling {
-            TagValue::from(
+            MvtValue::Double(
                 (self.reference + (value as f64) * self.binary_scale) * self.decimal_scale,
             )
         } else {
-            TagValue::SInt(value as i64)
+            MvtValue::SInt(value as i64)
         }
     }
 }
@@ -145,13 +189,13 @@ fn aggregate_band(values: &[CompactOptI32], aggregation: Aggregation) -> (Compac
 }
 
 fn merge_point(
-    points: &mut IndexMap<(u32, u32), Point>,
+    points: &mut PointMap<(u32, u32), Point>,
     key: (u32, u32),
     incoming: Point,
     aggregation: Aggregation,
     band_count: usize,
 ) {
-    use indexmap::map::Entry;
+    use std::collections::hash_map::Entry;
 
     match points.entry(key) {
         Entry::Vacant(entry) => {
@@ -201,51 +245,188 @@ fn merge_point(
     }
 }
 
+/// Clears omitted band values and removes points with no remaining attributes.
+fn apply_omits(
+    points: &mut PointMap<(u32, u32), Point>,
+    omits: &[Option<BandOmit>],
+    band_count: usize,
+) -> bool {
+    if !omits.iter().any(Option::is_some) {
+        return false;
+    }
+    for point in points.values_mut() {
+        for (index, omit) in omits.iter().enumerate() {
+            if let Some(omit) = omit {
+                point.values[index] = point.values[index].map(|value| {
+                    if omit.contains(value) {
+                        CompactOptI32::NONE
+                    } else {
+                        CompactOptI32::new(Some(value))
+                    }
+                });
+            }
+        }
+    }
+    points.retain(|_, point| {
+        point.values[..band_count]
+            .iter()
+            .any(|value| value.get().is_some())
+    });
+    points.is_empty()
+}
+
 pub(crate) fn zxy_to_chunk_id_range(base_z: u8, zxy: Zxy) -> (u64, u64) {
     let (z, x, y) = zxy;
     if z < base_z {
         let scale = 1 << (base_z - z);
-        let begin = xy_to_hilbert(z, x, y) * scale * scale;
+        let begin = xy2h(x, y, z) * scale * scale;
         (begin, begin + scale * scale)
     } else {
-        let begin = xy_to_hilbert(base_z, x >> (z - base_z), y >> (z - base_z));
+        let begin = xy2h(x >> (z - base_z), y >> (z - base_z), base_z);
         (begin, begin + 1)
     }
+}
+
+/// Measures a product's source values against the range an encoding can hold.
+///
+/// Wraps the band scaling rather than exposing it: the physical values are an
+/// internal detail of how a tile is built.
+pub(crate) fn inspect_raster_range(
+    product: &PreparedProduct,
+    encoding: ColorEncoding,
+) -> RangeReport {
+    raster::inspect_range(&product.chunks, &band_scales(product), encoding)
+}
+
+/// How each band's raw values turn into physical ones.
+fn band_scales(product: &PreparedProduct) -> Vec<BandScale<'_>> {
+    product
+        .spec
+        .band_specs
+        .iter()
+        .zip(&product.spec.quantize)
+        .map(|(band, quantize)| BandScale {
+            name: &band.name,
+            quantize: quantize.as_ref(),
+            scaling: band.binary_scale != 0
+                || band.reference_value != 0.0
+                || band.decimal_scale != 0,
+            reference: band.reference_value as f64,
+            binary_scale: 2f64.powi(band.binary_scale as i32),
+            decimal_scale: 10f64.powi(-band.decimal_scale as i32),
+        })
+        .collect()
+}
+
+/// The chunks a tile has to read to be rendered.
+///
+/// A raster tile carries a margin of its neighbours' pixels so that a client
+/// filtering across the boundary does not clamp at the edge, and the values in
+/// that margin come from points outside the tile. Reading only the tile's own
+/// chunks leaves the margin empty, which puts a one-pixel line of "no data"
+/// along every tile boundary - the opposite of what the margin is for.
+///
+/// The surrounding tiles are read whole and the points outside the margin are
+/// dropped by the bounds test in [`make_layer`], which is cheaper than working
+/// out which chunks the margin actually touches.
+fn source_chunks(
+    product: &PreparedProduct,
+    zxy: Zxy,
+    output: TileOutput,
+) -> Vec<&[(u64, crate::model::BaseTile)]> {
+    let (z, x, y) = zxy;
+    let range = |zxy| {
+        let (begin, end) = zxy_to_chunk_id_range(product.spec.base_z, zxy);
+        product.chunks_in_range(begin, end)
+    };
+    if !matches!(output, TileOutput::Raster(_)) {
+        return vec![range(zxy)];
+    }
+
+    let last = (1u32 << z) - 1;
+    let mut chunks = Vec::with_capacity(9);
+    for dy in -1i64..=1 {
+        for dx in -1i64..=1 {
+            // Longitude wraps; latitude does not.
+            let Some(neighbour_y) = y.checked_add_signed(dy as i32).filter(|y| *y <= last) else {
+                continue;
+            };
+            let neighbour_x = (i64::from(x) + dx).rem_euclid(i64::from(last) + 1) as u32;
+            let chunk = range((z, neighbour_x, neighbour_y));
+            if !chunk.is_empty() {
+                chunks.push(chunk);
+            }
+        }
+    }
+    chunks
+}
+
+/// What a tile is rendered as.
+///
+/// MVT layers of several products concatenate into one tile, which is how a
+/// forecast sequence becomes one archive. Images cannot be concatenated, so a
+/// raster archive holds a single product; [`crate::archive`] enforces that.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TileOutput {
+    Mvt,
+    Raster(ColorEncoding),
 }
 
 pub(crate) fn make_layer(
     tile_context: &TileContext,
     product: &PreparedProduct,
     layer_name: &str,
-) -> Option<Layer> {
+    output: TileOutput,
+) -> Result<Option<Vec<u8>>> {
     let extent = 4096;
     let (z, _, _) = tile_context.zxy;
     let (chunk_begin, chunk_end) = zxy_to_chunk_id_range(product.spec.base_z, tile_context.zxy);
-    let chunks = product.chunks_in_range(chunk_begin, chunk_end);
-    if chunks.is_empty() {
-        return None;
+    if product.chunks_in_range(chunk_begin, chunk_end).is_empty() {
+        return Ok(None);
     }
+    let chunks = source_chunks(product, tile_context.zxy, output);
 
     let maximum_detail_zoom = (product.spec.grid_spec.lat_denom * 360.0 * 2.0 / 512.0)
         .log2()
         .round() as u8;
 
+    // A raster tile interpolates, so it needs the grid points bracketing every
+    // pixel it writes - including the ones in its margin, which sit outside the
+    // tile. The margin `TileContext` carries is a fraction of the tile, and at
+    // the deeper zooms that is narrower than one grid cell, which left the
+    // outermost point of the bracket behind and made a seam disagree by a code.
+    let reach = match output {
+        TileOutput::Raster(_) => {
+            let grid = &product.spec.grid_spec;
+            (
+                2.0 / f64::from(grid.lng_denom),
+                2.0 / f64::from(grid.lat_denom).abs(),
+            )
+        }
+        TileOutput::Mvt => (0.0, 0.0),
+    };
+    let geographic_bounds = tile_context.geographic_bounds.expanded(reach.0, reach.1);
+    let wrapped_geographic_bounds = tile_context
+        .wrapped_geographic_bounds
+        .expanded(reach.0, reach.1);
+
     let aggregation = product.spec.aggregation;
     let band_count = product.spec.band_specs.len();
     let mut points = chunks
         .par_iter()
-        .fold(IndexMap::default, |mut points, (_, tile)| {
+        .flat_map(|chunk| chunk.par_iter())
+        .fold(PointMap::default, |mut points, (_, tile)| {
             let aggregation_scale = maximum_detail_zoom.saturating_sub(z);
             let aggregation_width = 1 << aggregation_scale;
             let mut previous_end = 0;
 
             for ((grid_x, grid_y, point_power), group) in tile
-                .point_ids
+                .point_positions
                 .iter()
                 .copied()
                 .zip_eq(tile.point_powers.iter().copied())
-                .chunk_by(|&(point_id, point_power)| {
-                    let (x, y) = hilbert_to_xy(16, point_id as u64);
+                .chunk_by(|&((x, y), point_power)| {
+                    let (x, y) = (u32::from(x), u32::from(y));
                     (
                         x - x % aggregation_width,
                         y - y % aggregation_width,
@@ -266,11 +447,8 @@ pub(crate) fn make_layer(
                 let lat2 = grid.lat_0 + (grid_y as f64 - 0.5) / grid.lat_denom as f64;
                 let lat1 = grid.lat_0 + ((grid_y + width) as f64 - 0.5) / grid.lat_denom as f64;
                 let point_box = LngLatBox::new(LngLat::new(lng1, lat1), LngLat::new(lng2, lat2));
-                if !tile_context.geographic_bounds.intersects_box(&point_box)
-                    && (lng2 <= 180.0
-                        || !tile_context
-                            .wrapped_geographic_bounds
-                            .intersects_box(&point_box))
+                if !geographic_bounds.intersects_box(&point_box)
+                    && (lng2 <= 180.0 || !wrapped_geographic_bounds.intersects_box(&point_box))
                 {
                     continue;
                 }
@@ -296,14 +474,14 @@ pub(crate) fn make_layer(
             }
             points
         })
-        .reduce(IndexMap::default, |mut left, right| {
+        .reduce(PointMap::default, |mut left, right| {
             for (key, point) in right {
                 merge_point(&mut left, key, point, aggregation, band_count);
             }
             left
         });
     if points.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     if product.spec.aggregation == Aggregation::RoughAvg {
@@ -313,6 +491,13 @@ pub(crate) fn make_layer(
                     .map(|value| CompactOptI32::new(Some(value / point.counts[index])));
             }
         }
+    }
+
+    // `--omit-zero` means physical zero, independently of any representative
+    // value chosen by quantization. Apply it while points still carry raw
+    // values so a positive value in a class that emits zero remains present.
+    if apply_omits(&mut points, &product.spec.omit_zero, band_count) {
+        return Ok(None);
     }
 
     // Quantize before the polygons are grouped, so that cells sharing a class
@@ -331,66 +516,135 @@ pub(crate) fn make_layer(
         }
     }
 
-    // Omitted values are cleared and their points dropped. Clearing alone would
-    // leave an untagged polygon behind, which defeats the purpose. This runs
-    // after quantization because a quantized point carries its class index.
-    if product.spec.omit.iter().any(Option::is_some) {
-        for point in points.values_mut() {
-            for (index, omit) in product.spec.omit.iter().enumerate() {
-                if let Some(omit) = omit {
-                    point.values[index] = point.values[index].map(|value| {
-                        if omit.contains(value) {
-                            CompactOptI32::NONE
-                        } else {
-                            CompactOptI32::new(Some(value))
-                        }
-                    });
-                }
-            }
-        }
-        points.retain(|_, point| {
-            point.values[..band_count]
-                .iter()
-                .any(|value| value.get().is_some())
-        });
-        if points.is_empty() {
-            return None;
-        }
+    // `--omit-class` targets the representative values of quantized classes,
+    // so it runs after raw values have become class indices.
+    if apply_omits(&mut points, &product.spec.omit_class, band_count) {
+        return Ok(None);
     }
 
-    let band_scales = product
-        .spec
-        .band_specs
-        .iter()
-        .zip(&product.spec.quantize)
-        .map(|(band, quantize)| BandScale {
-            name: &band.name,
-            quantize: quantize.as_ref(),
-            scaling: band.binary_scale != 0
-                || band.reference_value != 0.0
-                || band.decimal_scale != 0,
-            reference: band.reference_value as f64,
-            binary_scale: 2f64.powi(band.binary_scale as i32),
-            decimal_scale: 10f64.powi(-band.decimal_scale as i32),
-        })
-        .collect_vec();
+    let band_scales = band_scales(product);
 
-    mvt::render_mvt_layer(
-        layer_name,
-        &product.spec,
-        extent,
-        &tile_context.bounds,
-        &points,
-        &band_scales,
-    )
+    match output {
+        TileOutput::Mvt => mvt::render_mvt_layer(
+            layer_name,
+            &product.spec,
+            extent,
+            &tile_context.bounds,
+            &points,
+            &band_scales,
+        ),
+        TileOutput::Raster(encoding) => raster::render_raster_tile(
+            &product.spec,
+            tile_context.zxy,
+            &points,
+            &band_scales,
+            encoding,
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The chunk ranges rely on the Hilbert curve's self-similarity: a tile's
+    /// range has to be exactly the four ranges of its children, with no gap and
+    /// no overlap. Passing the zoom to `xy2h` in the wrong argument position
+    /// still returns an id, so this pins the property rather than the numbers.
+    #[test]
+    fn a_tiles_chunk_range_is_partitioned_by_its_children() {
+        let base_z = 4;
+        for z in 0..base_z {
+            for x in 0..(1u32 << z) {
+                for y in 0..(1u32 << z) {
+                    let (begin, end) = zxy_to_chunk_id_range(base_z, (z, x, y));
+                    let mut children = [
+                        (2 * x, 2 * y),
+                        (2 * x + 1, 2 * y),
+                        (2 * x, 2 * y + 1),
+                        (2 * x + 1, 2 * y + 1),
+                    ]
+                    .map(|(cx, cy)| zxy_to_chunk_id_range(base_z, (z + 1, cx, cy)));
+                    children.sort_unstable();
+
+                    assert_eq!(children[0].0, begin, "z={z} ({x},{y})");
+                    assert_eq!(children[3].1, end, "z={z} ({x},{y})");
+                    for pair in children.windows(2) {
+                        assert_eq!(pair[0].1, pair[1].0, "gap or overlap at z={z} ({x},{y})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// At the base zoom every tile takes exactly one chunk, and together they
+    /// cover the whole range without repeating one.
+    #[test]
+    fn base_zoom_tiles_map_one_to_one_onto_the_chunk_ids() {
+        let base_z = 4;
+        let mut seen = vec![false; 1 << (2 * base_z)];
+        for x in 0..(1u32 << base_z) {
+            for y in 0..(1u32 << base_z) {
+                let (begin, end) = zxy_to_chunk_id_range(base_z, (base_z, x, y));
+                assert_eq!(end, begin + 1, "({x},{y})");
+                assert!(!seen[begin as usize], "chunk {begin} claimed twice");
+                seen[begin as usize] = true;
+            }
+        }
+        assert!(seen.into_iter().all(|hit| hit));
+    }
+
     fn value(value: i32) -> CompactOptI32 {
         CompactOptI32::new(Some(value))
+    }
+
+    #[test]
+    fn omit_zero_keeps_positive_values_that_quantize_to_zero() {
+        let spec = gpv_products::model::BandSpec {
+            name: "value".to_string(),
+            ..Default::default()
+        };
+        let zero_omits = crate::quantize::resolve_zero_omits(true, std::slice::from_ref(&spec));
+        let quantize = crate::quantize::resolve(&["0,5".to_string()], &[spec])
+            .unwrap()
+            .pop()
+            .flatten()
+            .unwrap();
+        let mut points = PointMap::from_iter([
+            (
+                (0, 0),
+                Point {
+                    values: [
+                        value(0),
+                        CompactOptI32::NONE,
+                        CompactOptI32::NONE,
+                        CompactOptI32::NONE,
+                    ],
+                    ..Default::default()
+                },
+            ),
+            (
+                (1, 0),
+                Point {
+                    values: [
+                        value(1),
+                        CompactOptI32::NONE,
+                        CompactOptI32::NONE,
+                        CompactOptI32::NONE,
+                    ],
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        assert!(!apply_omits(&mut points, &zero_omits, 1));
+        assert!(!points.contains_key(&(0, 0)));
+        let positive = points.get_mut(&(1, 0)).unwrap();
+        positive.values[0] =
+            positive.values[0].map(|raw| CompactOptI32::new(Some(quantize.class_of(raw))));
+
+        assert_eq!(positive.values[0], value(0));
+        assert_eq!(quantize.output(0), 0.0);
     }
 
     fn band(scaling: bool, decimal_scale: f64) -> BandScale<'static> {
@@ -409,8 +663,8 @@ mod tests {
         let band = band(true, 0.1);
 
         // 1.0 and 1.5 must land in the same column type.
-        assert_eq!(band.tag_value(10), TagValue::from(1.0f64));
-        assert_eq!(band.tag_value(15), TagValue::from(1.5f64));
+        assert_eq!(band.tag_value(10), MvtValue::Double(1.0));
+        assert_eq!(band.tag_value(15), MvtValue::Double(1.5));
     }
 
     #[test]
@@ -419,12 +673,9 @@ mod tests {
 
         // 2^24 is where f32 stops holding consecutive integers, and i32 would
         // saturate above 2^31.
-        assert_eq!(band.tag_value(33_554_450), TagValue::from(33_554_450.0f64));
-        assert_eq!(band.tag_value(i32::MAX), TagValue::from(2_147_483_647.0f64));
-        assert_eq!(
-            band.tag_value(-33_554_450),
-            TagValue::from(-33_554_450.0f64)
-        );
+        assert_eq!(band.tag_value(33_554_450), MvtValue::Double(33_554_450.0));
+        assert_eq!(band.tag_value(i32::MAX), MvtValue::Double(2_147_483_647.0));
+        assert_eq!(band.tag_value(-33_554_450), MvtValue::Double(-33_554_450.0));
     }
 
     #[test]
@@ -449,9 +700,9 @@ mod tests {
 
         // Integral outputs collapse the column to sint, and the value passed in
         // is a class index rather than a raw value.
-        assert_eq!(band.tag_value(0), TagValue::SInt(0));
-        assert_eq!(band.tag_value(1), TagValue::SInt(1));
-        assert_eq!(band.tag_value(2), TagValue::SInt(2));
+        assert_eq!(band.tag_value(0), MvtValue::SInt(0));
+        assert_eq!(band.tag_value(1), MvtValue::SInt(1));
+        assert_eq!(band.tag_value(2), MvtValue::SInt(2));
     }
 
     #[test]
@@ -474,18 +725,18 @@ mod tests {
             quantize: Some(&quantize),
         };
 
-        assert_eq!(band.tag_value(0), TagValue::from(0.0f64));
-        assert_eq!(band.tag_value(1), TagValue::from(0.5f64));
-        assert_eq!(band.tag_value(2), TagValue::from(1.5f64));
+        assert_eq!(band.tag_value(0), MvtValue::Double(0.0));
+        assert_eq!(band.tag_value(1), MvtValue::Double(0.5));
+        assert_eq!(band.tag_value(2), MvtValue::Double(1.5));
     }
 
     #[test]
     fn unscaled_band_emits_sint_on_both_sides_of_zero() {
         let band = band(false, 1.0);
 
-        assert_eq!(band.tag_value(-3), TagValue::SInt(-3));
-        assert_eq!(band.tag_value(0), TagValue::SInt(0));
-        assert_eq!(band.tag_value(7), TagValue::SInt(7));
+        assert_eq!(band.tag_value(-3), MvtValue::SInt(-3));
+        assert_eq!(band.tag_value(0), MvtValue::SInt(0));
+        assert_eq!(band.tag_value(7), MvtValue::SInt(7));
     }
 
     #[test]
@@ -516,7 +767,7 @@ mod tests {
     #[test]
     fn merge_only_updates_active_bands() {
         let key = (1, 2);
-        let mut points = IndexMap::default();
+        let mut points = PointMap::default();
         points.insert(
             key,
             Point {
@@ -553,7 +804,7 @@ mod tests {
             (Aggregation::Min, [value(5), value(7)]),
             (Aggregation::BitOr, [value(15), value(23)]),
         ] {
-            let mut points = IndexMap::default();
+            let mut points = PointMap::default();
             points.insert(
                 key,
                 Point {

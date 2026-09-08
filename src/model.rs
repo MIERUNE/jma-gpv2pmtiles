@@ -26,11 +26,6 @@ impl CompactOptI32 {
     }
 
     #[inline]
-    pub fn unwrap(self) -> i32 {
-        self.get().expect("missing value")
-    }
-
-    #[inline]
     pub fn unwrap_or(self, default: i32) -> i32 {
         self.get().unwrap_or(default)
     }
@@ -78,7 +73,7 @@ pub(crate) struct Band {
 
 #[derive(Debug)]
 pub(crate) struct BaseTile {
-    pub point_ids: Vec<u32>,
+    pub point_positions: Vec<(u16, u16)>,
     pub point_powers: Vec<u8>,
     pub bands: Vec<Band>,
 }
@@ -92,8 +87,10 @@ pub(crate) struct TilesetSpec {
     pub band_specs: Vec<BandSpec>,
     /// Optional quantization per band, in `band_specs` order.
     pub quantize: Vec<Option<BandQuantize>>,
-    /// Values dropped from the tile per band, in `band_specs` order.
-    pub omit: Vec<Option<BandOmit>>,
+    /// Physical zero dropped before quantization, in `band_specs` order.
+    pub omit_zero: Vec<Option<BandOmit>>,
+    /// Quantized output classes dropped from the tile, in `band_specs` order.
+    pub omit_class: Vec<Option<BandOmit>>,
     pub bounds: [f64; 4],
 }
 

@@ -23,6 +23,8 @@ pub struct PointValue {
 pub struct ProductData {
     pub points: Vec<PointValue>,
     pub band_specs: Vec<BandSpec>,
+    /// Base grid used by `points`; populated from the GRIB grid definition.
+    pub grid: Option<LngLatGrid>,
 }
 
 pub fn get_product_id_and_band(
@@ -992,11 +994,6 @@ impl GpvProductIdentifier {
             }
             _ => {}
         }
-    }
-
-    /// Zoom level at which chucks are generated
-    pub fn base_z(&self) -> u8 {
-        (self.grid().lat_denom * 360. * 2. / 512.).log2().ceil() as u8
     }
 }
 

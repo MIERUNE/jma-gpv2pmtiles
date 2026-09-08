@@ -16,12 +16,15 @@ use tinygrib2::{
     },
 };
 
-use crate::model::BandSpec;
+use crate::model::{BandSpec, LngLatGrid};
 use crate::products::{
     Ensemble, FixedSurface, GeneratingProcessType, GpvProductElement, GpvProductIdentifier,
     get_product_id_and_band,
 };
 use crate::products::{PointValue, ProductData};
+
+const MICRODEGREES_PER_DEGREE: f64 = 1_000_000.0;
+const GRID_TOLERANCE: f64 = 0.01;
 
 enum DataRepresentationTemplate {
     Template5_0(DataRepresentationTemplate5_0),
@@ -38,6 +41,210 @@ fn read_bitmap<R: Read>(reader: &mut R, num_points: usize) -> std::io::Result<Bi
     Ok(bitmap)
 }
 
+fn unsupported_grid(
+    product_id: &GpvProductIdentifier,
+    template: &GridDefinitionTemplate3_0,
+    reason: impl std::fmt::Display,
+) -> tinygrib2::Error {
+    tinygrib2::Error::UnsupportedData(format!(
+        "unsupported grid for {} (d_i={}, d_j={} microdegrees): {reason}",
+        product_id.path(),
+        template.d_i,
+        template.d_j
+    ))
+}
+
+/// Selects the finest base grid needed by one product while retaining the
+/// configured grid for products whose messages intentionally mix resolutions.
+fn resolve_product_grid(
+    product_id: &GpvProductIdentifier,
+    product: &ProductData,
+    template: &GridDefinitionTemplate3_0,
+) -> tinygrib2::Result<LngLatGrid> {
+    if template.d_i == 0 || template.d_j == 0 {
+        return Err(unsupported_grid(
+            product_id,
+            template,
+            "grid increments must be positive",
+        ));
+    }
+
+    let mut grid = product
+        .grid
+        .clone()
+        .unwrap_or_else(|| product_id.grid().clone());
+    let finer_longitude =
+        template.d_i as f64 + 1.0 < MICRODEGREES_PER_DEGREE / f64::from(grid.lng_denom);
+    let finer_latitude =
+        template.d_j as f64 + 1.0 < MICRODEGREES_PER_DEGREE / f64::from(grid.lat_denom);
+
+    if (finer_longitude || finer_latitude) && !product.points.is_empty() {
+        return Err(unsupported_grid(
+            product_id,
+            template,
+            "a finer grid appeared after values for this product had already been read",
+        ));
+    }
+    if finer_longitude {
+        grid.lng_denom = (MICRODEGREES_PER_DEGREE / template.d_i as f64) as f32;
+    }
+    if finer_latitude {
+        grid.lat_denom = (MICRODEGREES_PER_DEGREE / template.d_j as f64) as f32;
+    }
+    Ok(grid)
+}
+
+/// The base-grid coordinates of a grid's lower-left corner.
+///
+/// The corner has to sit on a cell boundary, so dividing it by the cell width
+/// has to come out whole. Multiplying by the width instead - as this once did -
+/// is a test every whole coordinate passes whatever width it is checked
+/// against, so it never rejected anything.
+///
+/// Replacing it with the real test refuses products that convert today. The
+/// hourly nowcast lands on `6401.50032` base cells, which is neither a whole
+/// cell nor a clean half, and the truncation below has been moving it one base
+/// cell west and south ever since. That is a fault in the base grid this
+/// product is measured against rather than in the file, so the shift is kept -
+/// silently dropping a supported product would be worse - and reported, so it
+/// stops being invisible.
+#[derive(Debug, PartialEq, Eq)]
+struct GridCorner {
+    x: u32,
+    y: u32,
+    snap: Option<(u32, u32)>,
+}
+
+fn grid_corner(
+    product_id: &GpvProductIdentifier,
+    template: &GridDefinitionTemplate3_0,
+    grid: &LngLatGrid,
+    width: u32,
+) -> tinygrib2::Result<GridCorner> {
+    let longitude = (template.lo1 as f64 + 1. - MICRODEGREES_PER_DEGREE * grid.lng_0)
+        * f64::from(grid.lng_denom)
+        / MICRODEGREES_PER_DEGREE;
+    let latitude = (template.la1 as f64 + 1. - MICRODEGREES_PER_DEGREE * grid.lat_0)
+        * f64::from(grid.lat_denom)
+        / MICRODEGREES_PER_DEGREE;
+    if longitude < 0. || latitude < 0. {
+        return Err(unsupported_grid(
+            product_id,
+            template,
+            format!("its corner ({longitude}, {latitude}) precedes the base grid origin"),
+        ));
+    }
+
+    let (x_first, y_last) = (longitude as i64, latitude as i64);
+    let (x_aligned, y_aligned) = (
+        x_first - x_first % i64::from(width),
+        y_last - y_last % i64::from(width),
+    );
+    let snap = (x_aligned != x_first || y_aligned != y_last)
+        .then_some(((x_first - x_aligned) as u32, (y_last - y_aligned) as u32));
+    Ok(GridCorner {
+        x: x_aligned as u32,
+        y: y_aligned as u32,
+        snap,
+    })
+}
+
+/// Rejects grids whose coordinates cannot be represented by [`PointValue`].
+///
+/// The point-building loops can then use ordinary arithmetic and lossless
+/// `u16` casts without a malformed grid causing an overflow panic or wrap.
+fn validate_grid_extent(
+    product_id: &GpvProductIdentifier,
+    template: &GridDefinitionTemplate3_0,
+    x_first: u32,
+    y_first: u32,
+    width: u32,
+) -> tinygrib2::Result<()> {
+    let x_steps = template
+        .n_i
+        .checked_sub(1)
+        .ok_or_else(|| unsupported_grid(product_id, template, "the longitude point count is zero"))?
+        .checked_mul(width)
+        .ok_or_else(|| unsupported_grid(product_id, template, "the longitude extent overflows"))?;
+    let y_steps = template
+        .n_j
+        .checked_sub(1)
+        .ok_or_else(|| unsupported_grid(product_id, template, "the latitude point count is zero"))?
+        .checked_mul(width)
+        .ok_or_else(|| unsupported_grid(product_id, template, "the latitude extent overflows"))?;
+    let x_last = x_first
+        .checked_add(x_steps)
+        .ok_or_else(|| unsupported_grid(product_id, template, "the longitude extent overflows"))?;
+    let y_last = match template.scanning_mode {
+        0 => y_first.checked_sub(y_steps).ok_or_else(|| {
+            unsupported_grid(
+                product_id,
+                template,
+                "the latitude extent precedes the configured origin",
+            )
+        })?,
+        64 => y_first.checked_add(y_steps).ok_or_else(|| {
+            unsupported_grid(product_id, template, "the latitude extent overflows")
+        })?,
+        mode => {
+            return Err(unsupported_grid(
+                product_id,
+                template,
+                format!("scanning mode {mode} is not supported"),
+            ));
+        }
+    };
+
+    if [x_first, x_last, y_first, y_last]
+        .into_iter()
+        .any(|coordinate| coordinate > u32::from(u16::MAX))
+    {
+        return Err(unsupported_grid(
+            product_id,
+            template,
+            format!(
+                "its base-grid extent ({x_first}, {y_first})..({x_last}, {y_last}) exceeds the u16 coordinate range"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn grid_cell_width(
+    product_id: &GpvProductIdentifier,
+    template: &GridDefinitionTemplate3_0,
+    grid: &LngLatGrid,
+) -> tinygrib2::Result<u32> {
+    let longitude_width = template.d_i as f64 * f64::from(grid.lng_denom) / MICRODEGREES_PER_DEGREE;
+    let latitude_width = template.d_j as f64 * f64::from(grid.lat_denom) / MICRODEGREES_PER_DEGREE;
+    let rounded_longitude = longitude_width.round();
+    let rounded_latitude = latitude_width.round();
+    let valid = rounded_longitude >= 1.0
+        && rounded_longitude <= i32::MAX as f64
+        && (longitude_width - rounded_longitude).abs() < GRID_TOLERANCE
+        && (latitude_width - rounded_latitude).abs() < GRID_TOLERANCE
+        && rounded_longitude == rounded_latitude;
+    if !valid {
+        return Err(unsupported_grid(
+            product_id,
+            template,
+            format!(
+                "increments map to unequal or fractional base-grid widths ({longitude_width}, {latitude_width})"
+            ),
+        ));
+    }
+
+    let width = rounded_longitude as u32;
+    if !width.is_power_of_two() {
+        return Err(unsupported_grid(
+            product_id,
+            template,
+            format!("cell width {width} is not a power of two"),
+        ));
+    }
+    Ok(width)
+}
+
 #[derive(Default)]
 pub struct GridSquareMessageReader {
     ids: Option<IdentificationSectionHeader>,
@@ -47,9 +254,35 @@ pub struct GridSquareMessageReader {
     current_drs: Option<DataRepresentationSectionHeader>,
     current_drs_tmpl: Option<DataRepresentationTemplate>,
     current_bitmap: Option<BitVec>,
+    retained_product: Option<String>,
+    warned_grid_snap: bool,
     pub products: HashMap<GpvProductIdentifier, ProductData>,
     /// Track latest reference_datetime for each kind path
     pub latest_reference_times: HashMap<String, DateTime<Utc>>,
+}
+
+impl GridSquareMessageReader {
+    pub fn retaining_product(retained_product: Option<&str>) -> Self {
+        Self {
+            retained_product: retained_product.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    fn retains_values_for(&self, product_id: &GpvProductIdentifier) -> bool {
+        let Some(requested) = self.retained_product.as_deref() else {
+            return true;
+        };
+        let (data_kind, value_kind) = product_id.path_parts();
+        if value_kind.is_empty() {
+            requested == data_kind
+        } else {
+            requested
+                .strip_prefix(data_kind)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                == Some(value_kind)
+        }
+    }
 }
 
 impl<R: Read> MessageReader<R> for GridSquareMessageReader {
@@ -68,10 +301,25 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
         gds: tinygrib2::message::GridDefinitionSectionHeader,
         reader: &mut std::io::Take<&mut R>,
     ) -> tinygrib2::Result<()> {
-        assert_eq!(gds.template_number, 0);
+        if gds.template_number != 0 {
+            return Err(tinygrib2::Error::UnsupportedData(format!(
+                "grid definition template 3.{} is not supported",
+                gds.template_number
+            )));
+        }
         let tmpl = GridDefinitionTemplate3_0::read(reader)?;
-        assert_eq!(tmpl.resolution_and_component_flags, 0x30);
-        assert!(tmpl.scanning_mode == 0 || tmpl.scanning_mode == 64); // +i, -j
+        if tmpl.resolution_and_component_flags != 0x30 {
+            return Err(tinygrib2::Error::UnsupportedData(format!(
+                "grid resolution/component flags {:#04x} are not supported",
+                tmpl.resolution_and_component_flags
+            )));
+        }
+        if !matches!(tmpl.scanning_mode, 0 | 64) {
+            return Err(tinygrib2::Error::UnsupportedData(format!(
+                "grid scanning mode {} is not supported",
+                tmpl.scanning_mode
+            )));
+        }
         self.current_gds_tmpl = Some(tmpl);
         Ok(())
     }
@@ -183,6 +431,7 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
                         ..Default::default()
                     })
                     .collect(),
+                grid: None,
             });
 
         // Update latest reference_datetime for this kind
@@ -300,53 +549,63 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
         self.current_product_id
             .translate_values(&mut values, self.current_band);
 
+        // Keep parsing and decoding every section so malformed input is still
+        // reported, but do not retain millions of points for a product the
+        // caller has explicitly excluded. The empty ProductData entry created
+        // from section 4 remains available for selector validation and errors.
+        if !self.retains_values_for(&self.current_product_id) {
+            return Ok(());
+        }
+
         let gds_tmpl = self.current_gds_tmpl.as_ref().unwrap();
-        let grid = self.current_product_id.grid();
+        let product = self.products.get(&self.current_product_id).unwrap();
+        let grid = resolve_product_grid(&self.current_product_id, product, gds_tmpl)?;
 
         let (x_first, y_first, power) = {
-            assert!(
-                gds_tmpl.lo1.min(gds_tmpl.lo2) >= (grid.lng_0 * 1_000_000.) as i32,
-                "violate: {} >= {}",
-                gds_tmpl.lo1.min(gds_tmpl.lo2),
-                grid.lng_0
-            );
-            assert!(
-                gds_tmpl.la1.min(gds_tmpl.la2) >= (grid.lat_0 * 1_000_000.) as i32,
-                "violate: {} >= {}",
-                gds_tmpl.la1.min(gds_tmpl.la2),
-                grid.lat_0
-            );
-
-            let x_first = ((gds_tmpl.lo1 as f64 + 1. - 1_000_000. * grid.lng_0)
-                * grid.lng_denom as f64
-                / 1_000_000.) as i32;
-            let y_last = ((gds_tmpl.la1 as f64 + 1. - 1_000_000. * grid.lat_0)
-                * grid.lat_denom as f64
-                / 1_000_000.) as i32;
-            let width = ((gds_tmpl.d_i as f64 + 1.) / (1_000_000. / grid.lng_denom as f64)) as i32;
-            let power = width.ilog2() as u8;
-
-            // Note: check grid alignment
+            let grid_lng_0 = (grid.lng_0 * MICRODEGREES_PER_DEGREE) as i32;
+            let grid_lat_0 = (grid.lat_0 * MICRODEGREES_PER_DEGREE) as i32;
+            if gds_tmpl.lo1.min(gds_tmpl.lo2) < grid_lng_0
+                || gds_tmpl.la1.min(gds_tmpl.la2) < grid_lat_0
             {
-                let diff = (gds_tmpl.lo1 as f64 + 1. - 1_000_000. * grid.lng_0)
-                    * grid.lng_denom as f64
-                    * width as f64
-                    / 1_000_000.;
-                assert!(
-                    diff.fract() < 0.01,
-                    "invalid grid alignment: {diff} {width}",
-                );
+                return Err(unsupported_grid(
+                    &self.current_product_id,
+                    gds_tmpl,
+                    format!(
+                        "its lower-left extent precedes the configured origin ({}, {})",
+                        grid.lng_0, grid.lat_0
+                    ),
+                ));
             }
 
-            let x_first = (x_first - x_first % width) as u32;
-            let y_last = (y_last - y_last % width) as u32;
-            (x_first, y_last, power)
+            let width = grid_cell_width(&self.current_product_id, gds_tmpl, &grid)?;
+            let power = width.ilog2() as u8;
+            let corner = grid_corner(&self.current_product_id, gds_tmpl, &grid, width)?;
+            if let Some((x_shift, y_shift)) = corner.snap
+                && !self.warned_grid_snap
+            {
+                self.warned_grid_snap = true;
+                tracing::warn!(
+                    product = %self.current_product_id.path(),
+                    width,
+                    shift = format!("({x_shift}, {y_shift}) base cells"),
+                    "grid corner is not a multiple of the cell width; snapping this product's grids west and south"
+                );
+            }
+            validate_grid_extent(
+                &self.current_product_id,
+                gds_tmpl,
+                corner.x,
+                corner.y,
+                width,
+            )?;
+            (corner.x, corner.y, power)
         };
         let width = 1 << power;
         let product = self
             .products
             .entry(self.current_product_id.clone())
             .or_default();
+        product.grid = Some(grid);
 
         {
             let band = &mut product.band_specs[self.current_band as usize];
@@ -376,10 +635,23 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
                     _ => unimplemented!("Unsupported scanning mode: {}", gds_tmpl.scanning_mode),
                 } as u16;
                 for i in 0..gds_tmpl.n_i {
-                    if !bitmap_iter.next().unwrap() {
+                    let present = bitmap_iter.next().ok_or_else(|| {
+                        tinygrib2::Error::InvalidData(format!(
+                            "bitmap for {} has fewer entries than its {}x{} grid",
+                            self.current_product_id.path(),
+                            gds_tmpl.n_i,
+                            gds_tmpl.n_j
+                        ))
+                    })?;
+                    if !present {
                         continue;
                     };
-                    let value = match value_iter.next().unwrap() {
+                    let value = match value_iter.next().ok_or_else(|| {
+                        tinygrib2::Error::InvalidData(format!(
+                            "data for {} has fewer values than its bitmap",
+                            self.current_product_id.path()
+                        ))
+                    })? {
                         i32::MIN => continue,
                         v => v,
                     };
@@ -402,7 +674,14 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
                     _ => unimplemented!("Unsupported scanning mode: {}", gds_tmpl.scanning_mode),
                 } as u16;
                 for i in 0..gds_tmpl.n_i {
-                    let value = match value_iter.next().unwrap() {
+                    let value = match value_iter.next().ok_or_else(|| {
+                        tinygrib2::Error::InvalidData(format!(
+                            "data for {} has fewer values than its {}x{} grid",
+                            self.current_product_id.path(),
+                            gds_tmpl.n_i,
+                            gds_tmpl.n_j
+                        ))
+                    })? {
                         i32::MIN => continue,
                         v => v,
                     };
@@ -427,6 +706,39 @@ mod tests {
 
     use super::*;
 
+    fn grid_template(d_i: u32, d_j: u32) -> GridDefinitionTemplate3_0 {
+        GridDefinitionTemplate3_0 {
+            shape_of_earth: 0,
+            scale_factor_of_radius: 0,
+            scale_value_of_radius: 0,
+            scale_factor_of_major_axis: 0,
+            scale_value_of_major_axis: 0,
+            scale_factor_of_minor_axis: 0,
+            scale_value_of_minor_axis: 0,
+            n_i: 0,
+            n_j: 0,
+            basic_angle: 0,
+            subdivisions_of_basic_angle: 0,
+            la1: 0,
+            lo1: 0,
+            resolution_and_component_flags: 0x30,
+            la2: 0,
+            lo2: 0,
+            d_i,
+            d_j,
+            scanning_mode: 0,
+        }
+    }
+
+    fn lfm_isobaric_wind() -> GpvProductIdentifier {
+        GpvProductIdentifier {
+            kind: GpvProductElement::LfmWind,
+            surface: FixedSurface::IsobaricSurface(1000, 0),
+            generating_process: GeneratingProcessType::Forecast,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn read_bitmap_is_msb_first_and_truncates_partial_byte() {
         let mut reader = Cursor::new([0b1010_0110, 0b1100_0000, 0xff]);
@@ -440,5 +752,182 @@ mod tests {
                 true, false, true, false, false, true, true, false, true, true
             ]
         );
+    }
+
+    #[test]
+    fn a_finer_lfm_grid_is_derived_from_its_grib_increments() {
+        let product_id = lfm_isobaric_wind();
+        let template = grid_template(25_000, 20_000);
+        let grid = resolve_product_grid(&product_id, &ProductData::default(), &template).unwrap();
+
+        assert_eq!(grid.lng_denom, 40.0);
+        assert_eq!(grid.lat_denom, 50.0);
+        assert_eq!(grid_cell_width(&product_id, &template, &grid).unwrap(), 1);
+    }
+
+    /// A corner that does not sit on a cell boundary is snapped visibly rather
+    /// than being shifted with no diagnostic.
+    #[test]
+    fn a_corner_off_the_cell_boundary_is_snapped_and_reported() {
+        // A 0.05 degree base grid, so a 0.1 degree product has width 2 and
+        // needs an even corner.
+        let base = LngLatGrid {
+            lng_0: 120.,
+            lat_0: 20.,
+            lng_denom: 20.,
+            lat_denom: 20.,
+        };
+        let corner = |lo1, la1| {
+            let mut template = grid_template(100_000, 100_000);
+            template.lo1 = lo1;
+            template.la1 = la1;
+            template
+        };
+        let product_id = lfm_isobaric_wind();
+
+        // 120.00 and 20.00 are two cells from the origin: aligned.
+        let even = corner(120_000_000 - 1, 20_000_000 - 1);
+        assert_eq!(
+            grid_corner(&product_id, &even, &base, 2).unwrap(),
+            GridCorner {
+                x: 0,
+                y: 0,
+                snap: None,
+            }
+        );
+        let further = corner(120_100_000 - 1, 20_100_000 - 1);
+        assert_eq!(
+            grid_corner(&product_id, &further, &base, 2).unwrap(),
+            GridCorner {
+                x: 2,
+                y: 2,
+                snap: None,
+            }
+        );
+
+        // 120.05 is one base cell in, which a width-2 grid cannot start on.
+        // It is snapped down rather than refused, because a supported product
+        // lands here; the snap is what the warning reports.
+        let odd = corner(120_050_000 - 1, 20_000_000 - 1);
+        assert_eq!(
+            grid_corner(&product_id, &odd, &base, 2).unwrap(),
+            GridCorner {
+                x: 0,
+                y: 0,
+                snap: Some((1, 0)),
+            }
+        );
+        // At width 1 the same corner is exactly where it says it is.
+        assert_eq!(
+            grid_corner(&product_id, &odd, &base, 1).unwrap(),
+            GridCorner {
+                x: 1,
+                y: 0,
+                snap: None,
+            }
+        );
+
+        // A corner before the origin is still refused outright.
+        let before = corner(119_000_000 - 1, 20_000_000 - 1);
+        assert!(grid_corner(&product_id, &before, &base, 1).is_err());
+    }
+
+    #[test]
+    fn a_non_dyadic_grid_reports_an_error_instead_of_reaching_ilog2() {
+        let product_id = lfm_isobaric_wind();
+        let template = grid_template(150_000, 120_000);
+        let grid = resolve_product_grid(&product_id, &ProductData::default(), &template).unwrap();
+
+        let error = grid_cell_width(&product_id, &template, &grid).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cell width 3 is not a power of two")
+        );
+    }
+
+    #[test]
+    fn zero_grid_increments_report_an_explicit_error() {
+        let product_id = lfm_isobaric_wind();
+        let template = grid_template(0, 20_000);
+
+        let error =
+            resolve_product_grid(&product_id, &ProductData::default(), &template).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("grid increments must be positive")
+        );
+    }
+
+    #[test]
+    fn zero_point_counts_report_an_explicit_error() {
+        let product_id = lfm_isobaric_wind();
+        let mut template = grid_template(20_000, 20_000);
+        template.n_j = 1;
+
+        let error = validate_grid_extent(&product_id, &template, 0, 0, 1).unwrap_err();
+
+        assert!(error.to_string().contains("longitude point count is zero"));
+    }
+
+    #[test]
+    fn an_extent_outside_the_point_coordinate_range_is_refused() {
+        let product_id = lfm_isobaric_wind();
+        let mut template = grid_template(20_000, 20_000);
+        template.n_i = 2;
+        template.n_j = 1;
+
+        let error =
+            validate_grid_extent(&product_id, &template, u32::from(u16::MAX), 0, 1).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the u16 coordinate range")
+        );
+    }
+
+    #[test]
+    fn a_southward_extent_cannot_underflow_the_grid_origin() {
+        let product_id = lfm_isobaric_wind();
+        let mut template = grid_template(20_000, 20_000);
+        template.n_i = 1;
+        template.n_j = 2;
+
+        let error = validate_grid_extent(&product_id, &template, 0, 0, 1).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("latitude extent precedes the configured origin")
+        );
+    }
+
+    #[test]
+    fn retained_product_matches_exact_selector_parts() {
+        let mut product_id = GpvProductIdentifier {
+            kind: GpvProductElement::HiresNowcastIntensity,
+            ..Default::default()
+        };
+        let reader = GridSquareMessageReader::retaining_product(Some("hrnowc/intensity"));
+
+        assert!(reader.retains_values_for(&product_id));
+
+        product_id.kind = GpvProductElement::HiresNowcastIntensityError;
+        assert!(!reader.retains_values_for(&product_id));
+    }
+
+    #[test]
+    fn no_retained_product_filter_keeps_every_product() {
+        let reader = GridSquareMessageReader::retaining_product(None);
+        let product_id = GpvProductIdentifier {
+            kind: GpvProductElement::HiresNowcastIntensityError,
+            ..Default::default()
+        };
+
+        assert!(reader.retains_values_for(&product_id));
     }
 }

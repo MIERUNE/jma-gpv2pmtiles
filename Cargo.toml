@@ -15,24 +15,22 @@ resolver = "3"
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 flate2 = "1.1.9"
+fast-mvt = { version = "0.6.2", default-features = false, features = ["writer"] }
 fast_hilbert = "2.1.0"
 foldhash = "0.2.0"
 gpv-products = { path = "crates/gpv-products" }
-i_overlay = { version = "7.0.0", features = ["allow_multithreading"] }
-indexmap = "2.14.0"
 itertools = "0.14.0"
 pmtiles = { version = "0.23", default-features = false, features = ["write"] }
-prost = "0.14.4"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-tinygrib2 = { git = "https://github.com/MIERUNE/tinygrib2.git", rev = "37f4ee2bca4205bf08a645be9378af1bc56ec705" }
-tinymvt = "0.3.0"
+tinygrib2 = { git = "https://github.com/ciscorn/tinygrib2.git" }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = "0.3.23"
+png = "0.18.1"
 
 [dev-dependencies]
 chrono = "0.4.45"
 
 [profile.release]
-lto = "thin"
+lto = "fat"

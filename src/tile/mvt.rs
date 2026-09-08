@@ -1,19 +1,15 @@
+use anyhow::Result;
+use fast_mvt::{MvtGeometry, MvtLayerBuilder, MvtMultiPolygon};
 use foldhash::HashMap;
-use i_overlay::{
-    core::{
-        fill_rule::FillRule,
-        overlay::{ContourDirection, IntOverlayOptions, Overlay},
-        overlay_rule::OverlayRule,
-    },
-    i_float::int::point::IntPoint,
-    i_shape::int::shape::IntContour,
-};
 use rayon::prelude::*;
-use tinymvt::{vector_tile::tile::Layer, webmercator::lnglat_to_web_mercator};
 
 use crate::{
+    geo::lat_to_web_mercator_y,
     model::{CompactOptI32, TilesetSpec},
-    tile::{BandScale, IndexMap, Point, TileBounds},
+    tile::{
+        BandScale, Point, PointMap, TileBounds,
+        rect_union::{IntRect, union_rectangles},
+    },
 };
 
 pub(super) fn render_mvt_layer(
@@ -21,117 +17,107 @@ pub(super) fn render_mvt_layer(
     tileset_spec: &TilesetSpec,
     extent: i32,
     tile_bounds: &TileBounds,
-    deduped_points: &indexmap::IndexMap<(u32, u32), Point, foldhash::fast::RandomState>,
+    deduped_points: &PointMap<(u32, u32), Point>,
     band_scales: &Vec<BandScale<'_>>,
-) -> Option<Layer> {
-    let grouped_rings = make_polygons_grouped_by_value(
+) -> Result<Option<Vec<u8>>> {
+    let grouped_rectangles = make_rectangles_grouped_by_value(
         deduped_points,
         &tileset_spec.grid_spec,
         tile_bounds,
         extent,
     );
-    if grouped_rings.is_empty() {
-        return None;
+    if grouped_rectangles.is_empty() {
+        return Ok(None);
     }
 
     // Encode geometries
-    let value_geom = grouped_rings
+    let value_geom = grouped_rectangles
         .into_par_iter()
-        .map(|(values, contours)| {
-            let mut geom_enc = tinymvt::geometry::GeometryEncoder::new();
-
-            // Unary-union of polygons having same value
-            let mpoly = Overlay::with_contours_custom(
-                &contours,
-                &[],
-                IntOverlayOptions {
-                    output_direction: ContourDirection::CounterClockwise, // MVT spec
-                    ..Default::default()
-                },
-                Default::default(),
-            )
-            .overlay(OverlayRule::Subject, FillRule::Positive);
-
-            for poly in mpoly {
-                for ring in poly {
-                    geom_enc.add_ring(ring.iter().map(|p| [p.x, p.y]));
-                }
-            }
-            (values, geom_enc.into_vec())
+        .map(|(values, rectangles)| {
+            Ok((
+                values,
+                MvtGeometry::MultiPolygon(MvtMultiPolygon::new(union_rectangles(rectangles)?)),
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
+
+    // The groups came out of a hash map, whose order is seeded afresh on every
+    // run, so the features landed in the tile in a different order each time.
+    // The tiles were equivalent but never byte-identical, which rules out
+    // caching, delta distribution and signing. Ordering by the values makes the
+    // output a function of the input alone.
+    let mut value_geom = value_geom;
+    value_geom.sort_unstable_by_key(|(values, _)| *values);
 
     // Encode features
-    let mut tags_enc = tinymvt::tag::TagsEncoder::new();
-    let mut features = Vec::with_capacity(value_geom.len());
-    for (values, encoded_geom) in value_geom.into_iter() {
+    let mut layer = MvtLayerBuilder::with_capacity(layer_name, value_geom.len())?;
+    layer.extent(std::num::NonZeroU32::new(extent as u32).expect("MVT extent is positive"));
+    for (values, geometry) in value_geom {
+        let mut feature = layer.feature(&geometry)?;
         for (band, raw_value) in band_scales.iter().zip(values) {
             let Some(value) = raw_value.get() else {
                 continue;
             };
-            tags_enc.add(band.name, band.tag_value(value));
+            feature.tag(band.name, band.tag_value(value))?;
         }
 
-        let feat_id = match tileset_spec.band_specs.len() {
-            1 => values[0].unwrap() as u64,
-            2 => values[0].unwrap_or(0) as u64 | ((values[1].unwrap_or(0) as u64) << 32),
-            3 => {
-                // TODO: need improvements?
-                values[0].unwrap_or(0) as u64
-                    | ((values[1].unwrap_or(0) as u64) << 32)
-                    | ((values[2].unwrap_or(0) as u64) << 16)
-            }
-            4 => {
-                // TODO: need improvements?
-                values[0].unwrap_or(0) as u64
-                    | ((values[1].unwrap_or(0) as u64) << 32)
-                    | ((values[2].unwrap_or(0) as u64) << 16)
-                    | ((values[3].unwrap_or(0) as u64) << 24)
-            }
-            _ => unimplemented!("num_bands > 4 is not supported"),
-        };
-        features.push(tinymvt::vector_tile::tile::Feature {
-            id: Some(feat_id),
-            tags: tags_enc.take_tags(),
-            r#type: Some(tinymvt::vector_tile::tile::GeomType::Polygon as i32),
-            geometry: encoded_geom,
-        });
+        // An id is only set when it can be made unique. Casting a negative
+        // first band straight to `u64` sign-extended it, filling the high half
+        // with ones and swallowing whatever the second band was OR-ed into; the
+        // three- and four-band forms overlapped their bit ranges outright, so
+        // features with different values shared an id. Two bands are the most
+        // that fit exactly, and beyond that no id is better than a colliding
+        // one - the specification asks for uniqueness, and consumers use it to
+        // carry per-feature state.
+        if let Some(feature_id) = unique_feature_id(&values[..tileset_spec.band_specs.len()]) {
+            feature.id(Some(feature_id));
+        }
+        layer = feature.end();
     }
 
-    // Layer
-    let (keys, values) = tags_enc.into_keys_and_values();
-    Some(Layer {
-        version: 2,
-        name: layer_name.to_string(),
-        features,
-        keys,
-        values,
-        extent: Some(extent as u32),
-    })
+    Ok(Some(layer.encode()))
+}
+
+/// A feature id that no other value combination in the layer can share.
+///
+/// Each band is a whole `i32`, so only one or two of them fit in the 64 bits an
+/// id has. A band without a value has no code left to stand for it, so those
+/// features go without an id rather than share one.
+fn unique_feature_id(values: &[CompactOptI32]) -> Option<u64> {
+    let present = |value: &CompactOptI32| value.get().map(|value| u64::from(value as u32));
+    match values {
+        [first] => present(first),
+        [first, second] => Some((present(first)? << 32) | present(second)?),
+        _ => None,
+    }
 }
 
 /// Creates polygons from data points
-fn make_polygons_grouped_by_value(
-    deduped_points: &IndexMap<(u32, u32), Point>,
+fn make_rectangles_grouped_by_value(
+    deduped_points: &PointMap<(u32, u32), Point>,
     grid_spec: &gpv_products::model::LngLatGrid,
     tile_bounds: &TileBounds,
     extent: i32,
-) -> HashMap<[CompactOptI32; 4], Vec<IntContour<i32>>> {
-    let mut grouped_rings: HashMap<[CompactOptI32; 4], Vec<IntContour<i32>>> = HashMap::default();
+) -> HashMap<[CompactOptI32; 4], Vec<IntRect>> {
+    let mut grouped_rectangles: HashMap<[CompactOptI32; 4], Vec<IntRect>> = HashMap::default();
     let buffer_pixels = 2;
     let buffer = buffer_pixels * extent / 256;
     let tile_width = tile_bounds.mx2 - tile_bounds.mx1;
     let w = (extent as f64) / tile_width;
+    let mut projected_y = HashMap::<(u32, u32), (f64, f64)>::default();
 
     for ((x, y), point) in deduped_points {
         let value = point.values;
         let width = 1 << point.power;
         let lng1 = grid_spec.lng_0 + (*x as f64 - 0.5) / grid_spec.lng_denom as f64;
         let lng2 = grid_spec.lng_0 + ((*x + width) as f64 - 0.5) / grid_spec.lng_denom as f64;
-        let lat2 = grid_spec.lat_0 + (*y as f64 - 0.5) / grid_spec.lat_denom as f64;
-        let lat1 = grid_spec.lat_0 + ((*y + width) as f64 - 0.5) / grid_spec.lat_denom as f64;
-        let (mx1, my1) = lnglat_to_web_mercator(lng1, lat1);
-        let (mx2, my2) = lnglat_to_web_mercator(lng2, lat2);
+        let mx1 = (lng1 + 180.0) / 360.0;
+        let mx2 = (lng2 + 180.0) / 360.0;
+        let (my1, my2) = *projected_y.entry((*y, width)).or_insert_with(|| {
+            let lat2 = grid_spec.lat_0 + (*y as f64 - 0.5) / grid_spec.lat_denom as f64;
+            let lat1 = grid_spec.lat_0 + ((*y + width) as f64 - 0.5) / grid_spec.lat_denom as f64;
+            (lat_to_web_mercator_y(lat1), lat_to_web_mercator_y(lat2))
+        });
         let (mx1, mx2) = if mx2 > 1. {
             (mx1 - 1., mx2 - 1.)
         } else {
@@ -149,12 +135,10 @@ fn make_polygons_grouped_by_value(
 
         if ty1 < ty2 {
             if tx1 < tx2 {
-                grouped_rings.entry(value).or_default().push(vec![
-                    IntPoint { x: tx1, y: ty1 },
-                    IntPoint { x: tx2, y: ty1 },
-                    IntPoint { x: tx2, y: ty2 },
-                    IntPoint { x: tx1, y: ty2 },
-                ]);
+                grouped_rectangles
+                    .entry(value)
+                    .or_default()
+                    .push(IntRect::new(tx1, ty1, tx2, ty2));
             }
             // If wrap around anti-meridian
             // TODO: optimization?
@@ -166,16 +150,82 @@ fn make_polygons_grouped_by_value(
                     .floor() as i32)
                     .clamp(-buffer, extent + buffer);
                 if tx1 < tx2 {
-                    grouped_rings.entry(value).or_default().push(vec![
-                        IntPoint { x: tx1, y: ty1 },
-                        IntPoint { x: tx2, y: ty1 },
-                        IntPoint { x: tx2, y: ty2 },
-                        IntPoint { x: tx1, y: ty2 },
-                    ]);
+                    grouped_rectangles
+                        .entry(value)
+                        .or_default()
+                        .push(IntRect::new(tx1, ty1, tx2, ty2));
                 }
             }
         }
     }
 
-    grouped_rings
+    grouped_rectangles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(value: i32) -> CompactOptI32 {
+        CompactOptI32::new(Some(value))
+    }
+
+    /// A negative first band used to sign-extend into the high half of the id,
+    /// which both swallowed the second band and collided with every other
+    /// negative value that did the same.
+    #[test]
+    fn a_negative_band_does_not_swallow_the_one_beside_it() {
+        let left = unique_feature_id(&[value(-1), value(7)]);
+        let right = unique_feature_id(&[value(-1), value(9)]);
+
+        assert_ne!(left, right, "the second band has to reach the id");
+        assert_eq!(left, Some(0xFFFF_FFFF_0000_0007));
+    }
+
+    #[test]
+    fn distinct_value_pairs_get_distinct_ids() {
+        let pairs = [
+            [value(0), value(0)],
+            [value(0), value(1)],
+            [value(1), value(0)],
+            [value(-1), value(0)],
+            [value(0), value(-1)],
+            // i32::MIN is reserved for "missing", so the extremes a band can
+            // actually carry are one in from it.
+            [value(i32::MIN + 1), value(i32::MAX)],
+            [value(i32::MAX), value(i32::MIN + 1)],
+        ];
+        let ids = pairs
+            .iter()
+            .map(|pair| unique_feature_id(pair))
+            .collect::<Vec<_>>();
+
+        for (index, id) in ids.iter().enumerate() {
+            assert!(id.is_some());
+            assert!(
+                !ids[index + 1..].contains(id),
+                "{:?} shares an id with a later pair",
+                pairs[index]
+            );
+        }
+    }
+
+    /// Three bands are 96 bits, which cannot be squeezed into 64 without two
+    /// combinations meeting. Going without an id is the honest outcome.
+    #[test]
+    fn more_bands_than_fit_get_no_id() {
+        assert_eq!(unique_feature_id(&[value(1), value(2), value(3)]), None);
+        assert_eq!(
+            unique_feature_id(&[value(1), value(2), value(3), value(4)]),
+            None
+        );
+    }
+
+    /// A missing band has no code of its own, so the feature cannot be told
+    /// apart from one that happens to carry that code.
+    #[test]
+    fn a_missing_band_leaves_the_feature_without_an_id() {
+        assert_eq!(unique_feature_id(&[CompactOptI32::NONE]), None);
+        assert_eq!(unique_feature_id(&[value(1), CompactOptI32::NONE]), None);
+    }
 }

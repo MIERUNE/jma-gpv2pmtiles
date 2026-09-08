@@ -2,15 +2,14 @@ use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{SyncSender, sync_channel},
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use gpv_products::products::GeneratingProcessType;
+use gpv_products::products::{GeneratingProcessType, GpvProductIdentifier};
 
 use pmtiles::{Compression, PmTilesWriter, TileCoord, TileType};
-use prost::Message;
 use rayon::prelude::*;
 use tracing::info;
 
@@ -18,7 +17,7 @@ use crate::{
     metadata,
     model::PreparedProduct,
     prepare, quantize,
-    tile::{TileContext, Zxy, make_layer, zxy_to_chunk_id_range},
+    tile::{ColorEncoding, TileContext, TileOutput, Zxy, make_layer, zxy_to_chunk_id_range},
 };
 
 #[derive(Clone, Debug)]
@@ -34,10 +33,14 @@ pub struct ConvertOptions {
     pub rename: Vec<String>,
     /// One `--quantize` specification per band; see [`crate::quantize`].
     pub quantize: Vec<String>,
-    /// Values whose cells are left out of the tile, as `[<band>=]<value>[,...]`.
-    pub omit: Vec<String>,
-    /// Leave out cells whose value is zero, on every band.
+    /// Quantized class outputs left out of the tile, as `[<band>=]<value>[,...]`.
+    pub omit_class: Vec<String>,
+    /// Leave out cells whose physical value is zero before quantization.
     pub omit_zero: bool,
+    /// Emit RGBA raster tiles with this colour encoding instead of MVT.
+    pub raster: Option<String>,
+    /// Write an index of the raster archives to this path.
+    pub manifest: Option<PathBuf>,
     /// Drop products whose generating process is an analysis rather than a forecast.
     pub skip_analysis: bool,
     /// Keep only products at least this many minutes ahead of the reference time.
@@ -55,8 +58,10 @@ impl Default for ConvertOptions {
             layer_seq_start: 0,
             rename: Vec::new(),
             quantize: Vec::new(),
-            omit: Vec::new(),
+            omit_class: Vec::new(),
             omit_zero: false,
+            raster: None,
+            manifest: None,
             skip_analysis: false,
             min_lead_time: None,
         }
@@ -81,13 +86,14 @@ fn build_layer_names(options: &ConvertOptions, count: usize) -> Vec<String> {
 pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<()> {
     validate_options(options)?;
     info!(input = %input.display(), "parsing GRIB2");
-    let mut products = select_products(
-        prepare::read_products(input)?,
+    let products = select_products(
+        prepare::read_products(input, options.product.as_deref())?,
         options.product.as_deref(),
         options.layer_count,
         options.skip_analysis,
         options.min_lead_time,
     )?;
+    let mut products = prepare::prepare_products(products);
     let layer_names = build_layer_names(options, products.len());
 
     ensure_compatible_products(&products)?;
@@ -95,7 +101,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
     apply_quantization(
         &mut products,
         &options.quantize,
-        &options.omit,
+        &options.omit_class,
         options.omit_zero,
     )?;
     let max_zoom = options.max_zoom.unwrap_or_else(|| {
@@ -115,7 +121,345 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         options.min_zoom
     );
 
-    let bounds = combined_bounds(&products);
+    let output_format = match &options.raster {
+        Some(spec) => {
+            let encoding = spec.parse::<ColorEncoding>()?;
+            encoding.check_bands(
+                &products[0]
+                    .spec
+                    .band_specs
+                    .iter()
+                    .map(|band| band.name.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            TileOutput::Raster(encoding)
+        }
+        None => TileOutput::Mvt,
+    };
+
+    match output_format {
+        TileOutput::Mvt => {
+            ensure_distinct_paths(input, &[output.to_path_buf()], None)?;
+            write_archive(
+                output,
+                &products,
+                &layer_names,
+                options.min_zoom,
+                max_zoom,
+                output_format,
+                None,
+            )
+        }
+        TileOutput::Raster(_) => {
+            let outputs = raster_output_paths(output, &products, options.layer_seq_start)?;
+            ensure_distinct_paths(input, &outputs, options.manifest.as_deref())?;
+            for (index, ((product, layer_name), output)) in products
+                .iter()
+                .zip(&layer_names)
+                .zip(outputs.iter())
+                .enumerate()
+            {
+                write_archive(
+                    output,
+                    std::slice::from_ref(product),
+                    std::slice::from_ref(layer_name),
+                    options.min_zoom,
+                    max_zoom,
+                    output_format,
+                    Some(options.layer_seq_start + index),
+                )?;
+            }
+            if let Some(manifest) = &options.manifest {
+                write_manifest(
+                    manifest,
+                    &products,
+                    &outputs,
+                    output_format,
+                    options.min_zoom,
+                    max_zoom,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Expands a raster output pattern into one archive path per forecast time.
+/// Checks that nothing this run writes lands on the input or on another
+/// output, before the first byte is written.
+///
+/// The manifest is written after the archives, so pointing it at one of them
+/// replaced a perfectly good archive with JSON and still reported success.
+/// Where an archive sits as seen from the manifest.
+///
+/// Relative, so that the set can be moved or served from anywhere as a unit.
+/// Stripping the prefix alone only works when the archive is below the
+/// manifest; an archive beside or above it needs the `..` steps spelled out, or
+/// the client resolves the name against the wrong directory.
+fn absolute_lexical(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the current directory")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn relative_url(directory: &Path, output: &Path) -> Result<String> {
+    let directory = absolute_lexical(if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    })?;
+    let output = absolute_lexical(output)?;
+    if let Ok(below) = output.strip_prefix(&directory) {
+        return Ok(below
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/"));
+    }
+
+    let shared = directory
+        .components()
+        .zip(output.components())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let up = directory.components().count() - shared;
+    let mut url = "../".repeat(up);
+    url.push_str(
+        &output
+            .components()
+            .skip(shared)
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    );
+    Ok(url)
+}
+
+fn ensure_distinct_paths(input: &Path, outputs: &[PathBuf], manifest: Option<&Path>) -> Result<()> {
+    // Compared after resolving what exists, so that `./a.pmtiles` and
+    // `a.pmtiles` are recognised as the same file.
+    let resolve = |path: &Path| {
+        if let Ok(existing) = path.canonicalize() {
+            return existing;
+        }
+        // Nothing is there yet, so resolve the directory - which does exist -
+        // and keep the name. A bare name means the current directory, and
+        // leaving it bare would let `a.pmtiles` and `./a.pmtiles` pass as two
+        // different files.
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        match (parent.canonicalize(), path.file_name()) {
+            (Ok(parent), Some(name)) => parent.join(name),
+            _ => path.to_path_buf(),
+        }
+    };
+
+    let mut seen = BTreeSet::new();
+    let input = resolve(input);
+    for (label, path) in outputs
+        .iter()
+        .map(|path| ("an output", path.as_path()))
+        .chain(manifest.map(|path| ("the manifest", path)))
+    {
+        let resolved = resolve(path);
+        ensure!(
+            resolved != input,
+            "{label} would overwrite the input {}",
+            path.display()
+        );
+        ensure!(
+            seen.insert(resolved),
+            "{label} {} is written twice; give each forecast time its own path, and the \
+             manifest a path of its own",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Writes an index of the archives one run produced.
+///
+/// Animating a field means holding two forecast times at once and blending
+/// between them, and a client cannot do that from a set of archives it has to
+/// discover. The encoding is written once at the top: it is shared by every
+/// archive here, and a reader that finds it differing per time has no way to
+/// interpolate between them.
+fn write_manifest(
+    path: &Path,
+    products: &[PreparedProduct],
+    outputs: &[PathBuf],
+    output_format: TileOutput,
+    min_zoom: u8,
+    max_zoom: u8,
+) -> Result<()> {
+    let directory = path.parent().unwrap_or(Path::new(""));
+    let times = products
+        .iter()
+        .zip(outputs)
+        .map(|(product, output)| -> Result<_> {
+            let url = relative_url(directory, output)?;
+            let mut entry = serde_json::json!({
+                "url": url,
+                "valid_time": product.product_id.datetime.to_rfc3339(),
+                "reference_time": product.product_id.reference_datetime.to_rfc3339(),
+            });
+            // The extremes belong to one forecast time rather than to the set:
+            // a later hour can hold a jet the first one did not.
+            if let (Some(entry), TileOutput::Raster(encoding)) =
+                (entry.as_object_mut(), output_format)
+            {
+                entry.insert(
+                    "source_range".into(),
+                    metadata::range_report(
+                        &crate::tile::inspect_raster_range(product, encoding),
+                        encoding,
+                    ),
+                );
+            }
+            Ok(entry)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let encoding = match output_format {
+        // The whole descriptor rather than a summary of it. A client blending
+        // two times sets up its decode and its texture coordinates before it
+        // opens any archive, and having to open one to find the rest is exactly
+        // what the manifest is for avoiding.
+        TileOutput::Raster(encoding) => metadata::raster_encoding(products.first(), encoding),
+        TileOutput::Mvt => serde_json::Value::Null,
+    };
+    let manifest = serde_json::json!({
+        "generator": "grib2pmtiles",
+        "product": products.first().map(|product| product.spec.name.clone()),
+        "minzoom": min_zoom,
+        "maxzoom": max_zoom,
+        "bounds": combined_bounds(products),
+        "encoding": encoding,
+        "times": times,
+    });
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("failed to write the manifest {}", path.display()))?;
+    info!(manifest = %path.display(), times = products.len(), "wrote raster manifest");
+    Ok(())
+}
+
+fn raster_output_paths(
+    output: &Path,
+    products: &[PreparedProduct],
+    sequence_start: usize,
+) -> Result<Vec<PathBuf>> {
+    let count = products.len();
+    let Some(pattern) = output.to_str() else {
+        ensure!(count == 1, "a raster output pattern must be valid UTF-8");
+        return Ok(vec![output.to_path_buf()]);
+    };
+    let has_sequence = pattern.contains("{seq}");
+    let has_valid_time = pattern.contains("{valid_time}");
+    let has_reference_time = pattern.contains("{reference_time}");
+    if count == 1 && !(has_sequence || has_valid_time || has_reference_time) {
+        return Ok(vec![output.to_path_buf()]);
+    }
+    ensure!(
+        count == 1 || has_sequence || has_valid_time,
+        "--raster selected {count} forecast times, so the output path must contain the \
+         {{seq}} or {{valid_time}} placeholder (for example, wind_{{valid_time}}.pmtiles)"
+    );
+    let end = sequence_start
+        .checked_add(count)
+        .context("the raster output sequence number overflowed")?;
+    let outputs = (sequence_start..end)
+        .zip(products)
+        .map(|(sequence, product)| {
+            PathBuf::from(
+                pattern
+                    .replace("{seq}", &sequence.to_string())
+                    .replace(
+                        "{valid_time}",
+                        &product
+                            .product_id
+                            .datetime
+                            .format("%Y%m%d%H%M%S")
+                            .to_string(),
+                    )
+                    .replace(
+                        "{reference_time}",
+                        &product
+                            .product_id
+                            .reference_datetime
+                            .format("%Y%m%d%H%M%S")
+                            .to_string(),
+                    ),
+            )
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        outputs.iter().collect::<BTreeSet<_>>().len() == outputs.len(),
+        "the raster output pattern expands to duplicate paths; add {{seq}} or {{valid_time}}"
+    );
+    Ok(outputs)
+}
+
+fn write_archive(
+    output: &Path,
+    products: &[PreparedProduct],
+    layer_names: &[String],
+    min_zoom: u8,
+    max_zoom: u8,
+    output_format: TileOutput,
+    sequence: Option<usize>,
+) -> Result<()> {
+    // Measured over the source once, before any tile is written: saturation is
+    // invisible in the output, so it has to be reported from the input.
+    let range = match output_format {
+        TileOutput::Raster(encoding) => products.first().map(|product| {
+            let report = crate::tile::inspect_raster_range(product, encoding);
+            if report.is_clipping() {
+                let extremes = report
+                    .extremes
+                    .iter()
+                    .take(encoding.bands())
+                    .flatten()
+                    .map(|(low, high)| format!("{low:.3}..{high:.3}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::warn!(
+                    clipped = report.clipped,
+                    of = report.total,
+                    share = format!("{:.2}%", report.clipped_share()),
+                    observed = extremes,
+                    "values fall outside the encoding range and are saturated; \
+                     widen --raster to keep them"
+                );
+            }
+            report
+        }),
+        TileOutput::Mvt => None,
+    };
+
+    let bounds = combined_bounds(products);
     let center = ((bounds[0] + bounds[2]) / 2.0, (bounds[1] + bounds[3]) / 2.0);
     let archive_name = output
         .file_stem()
@@ -123,17 +467,20 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         .unwrap_or("grib2pmtiles");
     let metadata = serde_json::to_string(&metadata::generate_metadata(
         archive_name,
-        &products,
-        &layer_names,
+        products,
+        layer_names,
         bounds,
-        options.min_zoom,
-        max_zoom,
+        metadata::MetadataOptions {
+            min_zoom,
+            max_zoom,
+            output: output_format,
+            sequence,
+            range,
+        },
     ))?;
     info!(
         layers = products.len(),
-        min_zoom = options.min_zoom,
-        max_zoom,
-        "finished parsing GRIB2; generating PMTiles"
+        min_zoom, max_zoom, "finished parsing GRIB2; generating PMTiles"
     );
 
     if let Some(parent) = output.parent() {
@@ -147,33 +494,54 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         .truncate(true)
         .open(output)
         .with_context(|| format!("failed to create output {}", output.display()))?;
-    let mut writer = PmTilesWriter::new(TileType::Mvt)
-        .tile_compression(Compression::Gzip)
-        .min_zoom(options.min_zoom)
+    // A PNG is already deflated; gzipping it again only costs time.
+    let (tile_type, tile_compression) = match output_format {
+        TileOutput::Mvt => (TileType::Mvt, Compression::Gzip),
+        TileOutput::Raster(_) => (TileType::Png, Compression::None),
+    };
+    let mut writer = PmTilesWriter::new(tile_type)
+        .tile_compression(tile_compression)
+        .min_zoom(min_zoom)
         .max_zoom(max_zoom)
         .bounds(bounds[0], bounds[1], bounds[2], bounds[3])
         .center(center.0, center.1)
+        .center_zoom(center_zoom(bounds).clamp(min_zoom, max_zoom))
         .metadata(&metadata)
         .create(&mut file)?;
 
     let (sender, receiver) = sync_channel::<(Zxy, Vec<u8>)>(32);
     std::thread::scope(|scope| -> Result<()> {
         let producer_sender = sender.clone();
-        let product_refs = &products;
-        let layer_name_refs = &layer_names;
+        let product_refs = products;
+        let layer_name_refs = layer_names;
         let producer = scope.spawn(move || {
             traverse_tile_pyramid(
                 (0, 0, 0),
                 product_refs,
                 layer_name_refs,
-                options.min_zoom,
+                min_zoom,
                 max_zoom,
+                output_format,
                 &producer_sender,
             )
         });
         drop(sender);
 
-        while let Ok(((z, x, y), encoded_tile)) = receiver.recv() {
+        // Tiles arrive in whatever order the worker threads finish, which put
+        // them at different offsets on every run: the archives held identical
+        // tiles and never matched byte for byte, so nothing downstream could
+        // cache them, ship a delta of them or sign them. Collecting first and
+        // writing in tile order makes the archive a function of its input.
+        //
+        // The channel still bounds how far ahead the producer may run; this
+        // only holds the finished tiles, which the archive is about to hold
+        // anyway.
+        let mut tiles = Vec::new();
+        while let Ok((zxy, encoded_tile)) = receiver.recv() {
+            tiles.push((zxy, encoded_tile));
+        }
+        tiles.sort_unstable_by_key(|(zxy, _)| *zxy);
+        for ((z, x, y), encoded_tile) in tiles {
             writer.add_raw_tile(TileCoord::new(z, x, y)?, &encoded_tile)?;
         }
 
@@ -239,8 +607,15 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     for arg in &options.rename {
         parse_rename(arg)?;
     }
+    if let Some(spec) = &options.raster {
+        spec.parse::<ColorEncoding>()?;
+    }
+    ensure!(
+        options.manifest.is_none() || options.raster.is_some(),
+        "--manifest indexes the archives --raster produces, so it needs --raster as well"
+    );
     quantize::validate_syntax(&options.quantize)?;
-    quantize::validate_omit_syntax(&options.omit)?;
+    quantize::validate_omit_class_syntax(&options.omit_class)?;
     Ok(())
 }
 
@@ -280,7 +655,6 @@ fn apply_renames(products: &mut [PreparedProduct], args: &[String]) -> Result<()
     Ok(())
 }
 
-/// Applies the renames to a list of band names in place.
 fn resolve_renames(names: &mut [String], args: &[String]) -> Result<()> {
     for arg in args {
         let (from, to) = parse_rename(arg)?;
@@ -305,57 +679,89 @@ fn resolve_renames(names: &mut [String], args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Resolves `--quantize` once and shares it with every layer.
+/// Turns the physical `--quantize` boundaries and the omissions into the raw
+/// values each forecast time stores.
 ///
-/// `ensure_compatible_products` has already established that the products agree
-/// on their bands, so a single resolution applies to all of them.
+/// Resolved against every time's own band spec. The boundaries are physical,
+/// and the raw values they become depend on the packing reference and scale
+/// factors, which GRIB is free to change from one message to the next.
+/// Resolving once against the first time and copying the result quantized the
+/// later times against the wrong numbers, so a forecast hour came out
+/// differently depending on how many others were converted alongside it.
 fn apply_quantization(
     products: &mut [PreparedProduct],
     args: &[String],
-    omit_args: &[String],
+    omit_class_args: &[String],
     omit_zero: bool,
 ) -> Result<()> {
-    if args.is_empty() && omit_args.is_empty() && !omit_zero {
+    if args.is_empty() && omit_class_args.is_empty() && !omit_zero {
         return Ok(());
     }
-    let Some(first) = products.first() else {
-        return Ok(());
-    };
-    let band_specs = first.spec.band_specs.clone();
-    let resolved = if args.is_empty() {
-        vec![None; band_specs.len()]
-    } else {
-        quantize::resolve(args, &band_specs)?
-    };
-    let omits = quantize::resolve_omits(omit_args, omit_zero, &resolved, &band_specs)?;
 
-    for (index, band) in band_specs.iter().enumerate() {
-        if let Some(quantize) = &resolved[index] {
-            info!(
-                band = %band.name,
-                classes = quantize.class_count(),
-                "quantizing values"
-            );
-        }
-        if let Some(omit) = &omits[index] {
-            info!(band = %band.name, values = ?omit.physical(), "omitting values");
-        }
-    }
+    for (index, product) in products.iter_mut().enumerate() {
+        let band_specs = product.spec.band_specs.clone();
+        let resolved = if args.is_empty() {
+            vec![None; band_specs.len()]
+        } else {
+            quantize::resolve(args, &band_specs)?
+        };
+        let zero_omits = quantize::resolve_zero_omits(omit_zero, &band_specs);
+        let class_omits = quantize::resolve_class_omits(omit_class_args, &resolved, &band_specs)?;
 
-    for product in products {
-        product.spec.quantize = resolved.clone();
-        product.spec.omit = omits.clone();
+        // The specification is shared even though the raw values are not, so
+        // reporting it once says everything.
+        if index == 0 {
+            for (band_index, band) in band_specs.iter().enumerate() {
+                if let Some(quantize) = &resolved[band_index] {
+                    info!(
+                        band = %band.name,
+                        classes = quantize.class_count(),
+                        "quantizing values"
+                    );
+                }
+                if zero_omits[band_index].is_some() {
+                    info!(band = %band.name, "omitting physical zero before quantization");
+                }
+                if let Some(omit) = &class_omits[band_index] {
+                    info!(
+                        band = %band.name,
+                        values = ?omit.physical(),
+                        "omitting quantized classes"
+                    );
+                }
+            }
+        }
+
+        product.spec.quantize = resolved;
+        product.spec.omit_zero = zero_omits;
+        product.spec.omit_class = class_omits;
     }
     Ok(())
 }
 
-fn select_products(
-    mut products: Vec<PreparedProduct>,
+trait IdentifiedProduct {
+    fn product_id(&self) -> &GpvProductIdentifier;
+}
+
+impl IdentifiedProduct for PreparedProduct {
+    fn product_id(&self) -> &GpvProductIdentifier {
+        &self.product_id
+    }
+}
+
+impl IdentifiedProduct for prepare::RawProduct {
+    fn product_id(&self) -> &GpvProductIdentifier {
+        &self.product_id
+    }
+}
+
+fn select_products<T: IdentifiedProduct>(
+    mut products: Vec<T>,
     requested_product: Option<&str>,
     layer_count: Option<usize>,
     skip_analysis: bool,
     min_lead_time: Option<i64>,
-) -> Result<Vec<PreparedProduct>> {
+) -> Result<Vec<T>> {
     let available_products = products
         .iter()
         .map(product_selector)
@@ -372,8 +778,8 @@ fn select_products(
         // lead time floor is what separates "now" from the actual forecasts.
         let before = products.len();
         products.retain(|product| {
-            (product.product_id.datetime - product.product_id.reference_datetime).num_minutes()
-                >= minutes
+            let product_id = product.product_id();
+            (product_id.datetime - product_id.reference_datetime).num_minutes() >= minutes
         });
         ensure!(
             !products.is_empty(),
@@ -392,7 +798,7 @@ fn select_products(
         // keeps the numbering aligned with the forecast steps.
         let before = products.len();
         products.retain(|product| {
-            product.product_id.generating_process != GeneratingProcessType::Analysis
+            product.product_id().generating_process != GeneratingProcessType::Analysis
         });
         ensure!(
             !products.is_empty(),
@@ -405,10 +811,10 @@ fn select_products(
     }
 
     products.sort_by(|left, right| {
-        left.product_id
+        left.product_id()
             .datetime
-            .cmp(&right.product_id.datetime)
-            .then_with(|| left.product_id.path().cmp(&right.product_id.path()))
+            .cmp(&right.product_id().datetime)
+            .then_with(|| left.product_id().path().cmp(&right.product_id().path()))
     });
     if let Some(layer_count) = layer_count {
         ensure!(
@@ -421,8 +827,8 @@ fn select_products(
     Ok(products)
 }
 
-fn product_selector(product: &PreparedProduct) -> String {
-    let (data_kind, value_kind) = product.product_id.path_parts();
+fn product_selector(product: &impl IdentifiedProduct) -> String {
+    let (data_kind, value_kind) = product.product_id().path_parts();
     if value_kind.is_empty() {
         data_kind.to_string()
     } else {
@@ -484,11 +890,49 @@ fn combined_bounds(products: &[PreparedProduct]) -> [f64; 4] {
         bounds[2] = bounds[2].max(product.spec.bounds[2]);
         bounds[3] = bounds[3].max(product.spec.bounds[3]);
     }
-    bounds[0] = bounds[0].max(-180.0);
-    bounds[1] = bounds[1].max(-90.0);
-    bounds[2] = bounds[2].min(180.0);
-    bounds[3] = bounds[3].min(90.0);
-    bounds
+    let (west, east) = normalize_longitudes(bounds[0], bounds[2]);
+    [west, bounds[1].max(-90.0), east, bounds[3].min(90.0)]
+}
+
+/// Brings a longitude span into the `-180..180` a client expects.
+///
+/// A global product carries its own frame - GSM runs `0..360` - and clamping
+/// that span instead of wrapping it drops everything past the anti-meridian.
+/// The archive still holds those tiles; the client simply stops asking for
+/// them, because the bounds say the data ends at 180.
+fn normalize_longitudes(west: f64, east: f64) -> (f64, f64) {
+    // Whole-world spans are the common case here and cannot be expressed by
+    // wrapping, since both edges land on the same meridian.
+    if east - west >= 360.0 - f64::EPSILON {
+        return (-180.0, 180.0);
+    }
+
+    let wrap = |longitude: f64| (longitude + 180.0).rem_euclid(360.0) - 180.0;
+    let (west, east) = (wrap(west), wrap(east));
+    if west <= east {
+        (west, east)
+    } else {
+        // The span straddles the anti-meridian, which `[west, east]` cannot
+        // describe with west below east. Widening to the world keeps every
+        // tile reachable; the alternative loses one side of the seam.
+        (-180.0, 180.0)
+    }
+}
+
+/// A zoom at which the whole of `bounds` is on screen, for the client that
+/// opens the archive without being told where to look.
+///
+/// Left at zero the map starts fully zoomed out, and a regional product is a
+/// speck. This is the standard tile-count derivation: the span in tiles at a
+/// zoom doubles with each level, so invert it and step back one.
+fn center_zoom(bounds: [f64; 4]) -> u8 {
+    let longitude_span = (bounds[2] - bounds[0]).abs().max(f64::MIN_POSITIVE);
+    let latitude_span = (bounds[3] - bounds[1]).abs().max(f64::MIN_POSITIVE);
+    let zoom = (360.0 / longitude_span)
+        .min(180.0 / latitude_span)
+        .log2()
+        .floor();
+    zoom.clamp(0.0, 22.0) as u8
 }
 
 fn traverse_tile_pyramid(
@@ -497,6 +941,7 @@ fn traverse_tile_pyramid(
     layer_names: &[String],
     min_zoom: u8,
     max_zoom: u8,
+    output: TileOutput,
     sender: &SyncSender<(Zxy, Vec<u8>)>,
 ) -> Result<bool> {
     let has_source_data = products.iter().any(|product| {
@@ -513,15 +958,34 @@ fn traverse_tile_pyramid(
         let layers = products
             .par_iter()
             .zip(layer_names.par_iter())
-            .filter_map(|(product, layer_name)| make_layer(&tile_context, product, layer_name))
+            .map(|(product, layer_name)| make_layer(&tile_context, product, layer_name, output))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
         if !layers.is_empty() {
-            let protobuf = tinymvt::vector_tile::Tile { layers }.encode_to_vec();
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(&protobuf)?;
+            let tile = match output {
+                // MVT layers concatenate into one tile, and the archive stores
+                // them gzipped.
+                TileOutput::Mvt => {
+                    let mut protobuf = Vec::with_capacity(layers.iter().map(Vec::len).sum());
+                    for layer in layers {
+                        protobuf.extend_from_slice(&layer);
+                    }
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(&protobuf)?;
+                    encoder.finish()?
+                }
+                // Raster archives hold a single product, so there is exactly
+                // one image here and it is stored as it comes out.
+                TileOutput::Raster(_) => layers
+                    .into_iter()
+                    .next()
+                    .expect("the emptiness of the layers was just checked"),
+            };
             sender
-                .send((zxy, encoder.finish()?))
+                .send((zxy, tile))
                 .map_err(|_| anyhow::anyhow!("PMTiles writer stopped before tile generation"))?;
         }
     }
@@ -536,12 +1000,140 @@ fn traverse_tile_pyramid(
                     layer_names,
                     min_zoom,
                     max_zoom,
+                    output,
                     sender,
                 )?;
                 Ok::<_, anyhow::Error>(())
             })?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// The manifest is written after the archives, so aiming it at one of them
+    /// replaced a finished archive with JSON and still reported success.
+    #[test]
+    fn a_manifest_may_not_land_on_an_archive() {
+        let archive = PathBuf::from("wind.pmtiles");
+        assert!(
+            ensure_distinct_paths(Path::new("in.bin"), std::slice::from_ref(&archive), None)
+                .is_ok()
+        );
+        assert!(
+            ensure_distinct_paths(
+                Path::new("in.bin"),
+                std::slice::from_ref(&archive),
+                Some(&archive)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn two_forecast_times_may_not_share_a_path() {
+        let outputs = [
+            PathBuf::from("wind.pmtiles"),
+            PathBuf::from("./wind.pmtiles"),
+        ];
+        assert!(ensure_distinct_paths(Path::new("in.bin"), &outputs, None).is_err());
+    }
+
+    #[test]
+    fn nothing_may_be_written_over_the_input() {
+        let input = Path::new("in.bin");
+        assert!(ensure_distinct_paths(input, &[PathBuf::from("in.bin")], None).is_err());
+        assert!(
+            ensure_distinct_paths(input, &[PathBuf::from("out.pmtiles")], Some(input)).is_err()
+        );
+    }
+
+    /// A client resolves the url against the manifest's own directory, so an
+    /// archive that is not below it needs the steps back spelled out.
+    #[test]
+    fn a_url_is_relative_to_the_manifest_wherever_the_archive_sits() {
+        assert_eq!(
+            relative_url(Path::new("out"), Path::new("out/wind_0.pmtiles")).unwrap(),
+            "wind_0.pmtiles"
+        );
+        assert_eq!(
+            relative_url(Path::new("out/manifests"), Path::new("out/wind_0.pmtiles")).unwrap(),
+            "../wind_0.pmtiles"
+        );
+        assert_eq!(
+            relative_url(Path::new("manifests"), Path::new("wind_0.pmtiles")).unwrap(),
+            "../wind_0.pmtiles"
+        );
+        assert_eq!(
+            relative_url(Path::new("a/b"), Path::new("c/wind.pmtiles")).unwrap(),
+            "../../c/wind.pmtiles"
+        );
+    }
+
+    #[test]
+    fn relative_manifest_urls_do_not_depend_on_how_paths_were_spelled() {
+        let cwd = std::env::current_dir().unwrap();
+        let manifest_dir = cwd.join("out/manifests");
+        let archive = cwd.join("out/wind.pmtiles");
+
+        assert_eq!(
+            relative_url(&manifest_dir, Path::new("out/wind.pmtiles")).unwrap(),
+            "../wind.pmtiles"
+        );
+        assert_eq!(
+            relative_url(Path::new("out/manifests"), &archive).unwrap(),
+            "../wind.pmtiles"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    /// A global product carries its own longitude frame. GSM runs `0..360`, and
+    /// clamping that instead of wrapping it left bounds ending at 180: the
+    /// archive held the western hemisphere and no client ever asked for it.
+    #[test]
+    fn a_global_span_covers_the_world_whatever_frame_it_arrived_in() {
+        // GSM, half a cell either side of the full turn.
+        assert_eq!(normalize_longitudes(-0.125, 359.875), (-180.0, 180.0));
+        assert_eq!(normalize_longitudes(0.0, 360.0), (-180.0, 180.0));
+        assert_eq!(normalize_longitudes(-180.0, 180.0), (-180.0, 180.0));
+    }
+
+    #[test]
+    fn a_regional_span_keeps_its_own_edges() {
+        // MSM, which is already inside the range and must not be widened.
+        let (west, east) = normalize_longitudes(120.0, 150.0);
+        assert!((west - 120.0).abs() < 1e-9 && (east - 150.0).abs() < 1e-9);
+
+        // The same region expressed past the anti-meridian.
+        let (west, east) = normalize_longitudes(480.0, 510.0);
+        assert!((west - 120.0).abs() < 1e-9 && (east - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_span_across_the_anti_meridian_widens_rather_than_inverting() {
+        // `[west, east]` cannot hold west above east, and inverting it would
+        // lose one side of the seam.
+        assert_eq!(normalize_longitudes(170.0, 190.0), (-180.0, 180.0));
+    }
+
+    /// Left at zero a client opens a regional archive zoomed fully out, with
+    /// the data a speck in the middle.
+    #[test]
+    fn the_center_zoom_frames_the_data() {
+        // The world.
+        assert_eq!(center_zoom([-180.0, -85.0, 180.0, 85.0]), 0);
+        // MSM, roughly 30 degrees of longitude over Japan.
+        let msm = center_zoom([120.0, 22.0, 150.0, 48.0]);
+        assert!((2..=4).contains(&msm), "MSM framed at zoom {msm}");
+        // Something small enough that the zoom has to climb.
+        assert!(center_zoom([139.6, 35.6, 139.8, 35.8]) > msm);
+    }
 }
 
 #[cfg(test)]
@@ -579,6 +1171,85 @@ mod tests {
         assert_eq!(names.first().unwrap(), "rain1km6h_1");
         assert_eq!(names.last().unwrap(), "rain1km6h_6");
         assert_eq!(names.len(), 6);
+    }
+
+    #[test]
+    fn one_raster_time_accepts_a_plain_output_path() {
+        let products = [product(0, GeneratingProcessType::Forecast)];
+        assert_eq!(
+            raster_output_paths(Path::new("wind.pmtiles"), &products, 0).unwrap(),
+            [PathBuf::from("wind.pmtiles")]
+        );
+    }
+
+    #[test]
+    fn one_raster_time_expands_its_reference_time() {
+        let products = [product(0, GeneratingProcessType::Forecast)];
+        assert_eq!(
+            raster_output_paths(Path::new("wind_{reference_time}.pmtiles"), &products, 0).unwrap(),
+            [PathBuf::from("wind_20191012090500.pmtiles")]
+        );
+    }
+
+    #[test]
+    fn a_raster_output_pattern_expands_the_sequence() {
+        let products = [
+            product(0, GeneratingProcessType::Forecast),
+            product(5, GeneratingProcessType::Forecast),
+            product(10, GeneratingProcessType::Forecast),
+        ];
+        assert_eq!(
+            raster_output_paths(Path::new("wind_{seq}.pmtiles"), &products, 4).unwrap(),
+            [
+                PathBuf::from("wind_4.pmtiles"),
+                PathBuf::from("wind_5.pmtiles"),
+                PathBuf::from("wind_6.pmtiles"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_raster_output_pattern_expands_the_valid_time() {
+        let products = [
+            product(0, GeneratingProcessType::Forecast),
+            product(5, GeneratingProcessType::Forecast),
+        ];
+
+        assert_eq!(
+            raster_output_paths(
+                Path::new("wind_{reference_time}_{valid_time}_{seq}.pmtiles"),
+                &products,
+                7,
+            )
+            .unwrap(),
+            [
+                PathBuf::from("wind_20191012090500_20191012090500_7.pmtiles"),
+                PathBuf::from("wind_20191012090500_20191012091000_8.pmtiles"),
+            ]
+        );
+    }
+
+    #[test]
+    fn several_raster_times_require_an_output_pattern() {
+        let products = [
+            product(0, GeneratingProcessType::Forecast),
+            product(5, GeneratingProcessType::Forecast),
+        ];
+        let error = raster_output_paths(Path::new("wind.pmtiles"), &products, 0).unwrap_err();
+
+        assert!(error.to_string().contains("{valid_time}"));
+    }
+
+    #[test]
+    fn raster_output_paths_must_be_unique_after_expansion() {
+        let products = [
+            product(0, GeneratingProcessType::Analysis),
+            product(0, GeneratingProcessType::Forecast),
+        ];
+        let error =
+            raster_output_paths(Path::new("wind_{valid_time}.pmtiles"), &products, 0).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate"));
     }
 
     fn names(values: &[&str]) -> Vec<String> {
@@ -689,7 +1360,8 @@ mod tests {
                 aggregation: Aggregation::Max,
                 band_specs: Vec::new(),
                 quantize: Vec::new(),
-                omit: Vec::new(),
+                omit_zero: Vec::new(),
+                omit_class: Vec::new(),
                 bounds: [0.0; 4],
             },
             product_id,
@@ -704,6 +1376,54 @@ mod tests {
                 (product.product_id.datetime - product.product_id.reference_datetime).num_minutes()
             })
             .collect()
+    }
+
+    #[test]
+    fn products_are_selected_before_expensive_preparation() {
+        use gpv_products::products::{GpvProductElement, PointValue, ProductData};
+
+        let selected = product(0, GeneratingProcessType::Forecast);
+        let mut rejected = product(0, GeneratingProcessType::Forecast);
+        rejected.product_id.kind = GpvProductElement::HiresNowcastIntensityError;
+
+        // Preparing this point would panic because i32::MIN is the missing-value
+        // sentinel. Its presence makes the test verify that rejected raw products
+        // never reach prepare_product, rather than merely checking the result list.
+        let rejected = prepare::RawProduct {
+            product_id: rejected.product_id,
+            data: ProductData {
+                points: vec![PointValue {
+                    x: 0,
+                    y: 0,
+                    point_id: 0,
+                    point_power: 0,
+                    band_idx: 0,
+                    value: i32::MIN,
+                }],
+                band_specs: Vec::new(),
+                grid: None,
+            },
+        };
+        let selected = prepare::RawProduct {
+            product_id: selected.product_id,
+            data: ProductData::default(),
+        };
+
+        let selected = select_products(
+            vec![rejected, selected],
+            Some("hrnowc/intensity"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let prepared = prepare::prepare_products(selected);
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            product_selector(&prepared[0]),
+            "hrnowc/intensity".to_string()
+        );
     }
 
     #[test]

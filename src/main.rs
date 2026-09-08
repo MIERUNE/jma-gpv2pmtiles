@@ -10,7 +10,8 @@ struct Cli {
     /// Input GRIB2 file. Gzip-compressed input is detected from the .gz suffix.
     input: PathBuf,
 
-    /// Output PMTiles archive.
+    /// Output PMTiles archive. With --raster and several forecast times, this
+    /// must contain {seq} or {valid_time}, such as wind_{valid_time}.pmtiles.
     output: PathBuf,
 
     /// Product to convert, such as hrnowc/intensity. Required when the input contains several products.
@@ -69,18 +70,55 @@ struct Cli {
     #[arg(long, value_name = "SPEC")]
     quantize: Vec<String>,
 
-    /// Leave cells with these values out of the tile entirely, geometry
-    /// included. Values are in physical units, or the class value when
-    /// --quantize is used. Prefix with a band name when the product has several
-    /// bands, and repeat the option as needed.
+    /// Leave cells whose quantized class emits one of these values out of the
+    /// tile entirely, geometry included. Requires --quantize. Prefix with a
+    /// band name when the product has several bands, and repeat as needed.
     #[arg(long, value_name = "VALUES")]
-    omit: Vec<String>,
+    omit_class: Vec<String>,
 
-    /// Leave cells whose value is zero out of the tile, on every band. A
-    /// shorthand for --omit 0 that is simply ignored by bands which cannot
-    /// produce a zero.
+    /// Before quantization, leave cells whose physical value is exactly zero
+    /// out of the tile on every band. Ignored by bands which cannot represent
+    /// zero.
     #[arg(long)]
     omit_zero: bool,
+
+    /// Write RGBA raster tiles instead of MVT, encoding band values into the
+    /// colour channels so that a shader can read them back.
+    ///
+    /// The parameters belong to the archive rather than to a tile, so that
+    /// every tile decodes the same way and the field does not jump at a seam.
+    /// The channels, offset, scale and mask needed to decode them are recorded
+    /// as structured archive metadata.
+    ///
+    ///   vector-field:<component-limit>
+    ///                               two bands (u, v) for a particle layer.
+    ///                               Signed-normalised into red and green with
+    ///                               the on-grid flag in blue. The limit is per
+    ///                               component, so a field at the limit in both
+    ///                               directions has a magnitude sqrt(2) times
+    ///                               larger.
+    ///   scalar16:<min>,<max>        one band across red and green, on-grid
+    ///                               flag in blue. For a regional model, whose
+    ///                               grid stops partway across a tile.
+    ///   scalar24:<base>,<interval>  one band across all 24 colour bits. More
+    ///                               precise, but no room is left for a mask.
+    ///                               -10000,0.1 is Mapbox terrain-RGB exactly.
+    ///
+    /// One image cannot hold a sequence in a tile. When several forecast times
+    /// are selected, the output path must contain {seq} or {valid_time}; one
+    /// PMTiles archive is written for each time. {reference_time} is also
+    /// replaced, and timestamps use UTC YYYYMMDDHHMMSS.
+    #[arg(long, value_name = "SPEC", verbatim_doc_comment)]
+    raster: Option<String>,
+
+    /// Write an index of the archives --raster produced to this path.
+    ///
+    /// Lists each forecast time with the archive holding it, and the encoding
+    /// they share, so that a client can blend between two times without having
+    /// to discover the set first. The archive paths are relative to the
+    /// manifest.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -98,8 +136,10 @@ fn main() -> Result<()> {
             layer_seq_start: cli.layer_seq_start,
             rename: cli.rename,
             quantize: cli.quantize,
-            omit: cli.omit,
+            omit_class: cli.omit_class,
             omit_zero: cli.omit_zero,
+            raster: cli.raster,
+            manifest: cli.manifest,
             skip_analysis: cli.skip_analysis,
             min_lead_time: cli.min_lead_time,
         },

@@ -232,9 +232,8 @@ fn parse_number(text: &str) -> Result<f64> {
 
 /// Values whose cells are left out of the tile entirely.
 ///
-/// The values are stored in the space of what a point actually carries: class
-/// indices for a quantized band, raw values otherwise. That keeps the check in
-/// the tile pipeline an integer comparison in both cases.
+/// Values are stored in the integer space used at the pipeline stage where the
+/// omission runs: raw values before quantization or class indices after it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BandOmit {
     stored: Vec<i32>,
@@ -253,36 +252,49 @@ impl BandOmit {
     }
 }
 
-/// Resolves `--omit` and `--omit-zero` into per-band value sets.
+/// Resolves physical zero into raw per-band values for `--omit-zero`.
 ///
-/// `--omit` is strict: a value that cannot occur is an error, because the user
-/// named it explicitly. `--omit-zero` is a blanket convenience, so it is a
-/// no-op for bands that cannot emit zero.
-pub(crate) fn resolve_omits(
-    args: &[String],
+/// The blanket flag is a no-op for a band whose encoding cannot represent
+/// physical zero exactly.
+pub(crate) fn resolve_zero_omits(
     omit_zero: bool,
+    band_specs: &[BandSpec],
+) -> Vec<Option<BandOmit>> {
+    if !omit_zero {
+        return vec![None; band_specs.len()];
+    }
+
+    band_specs
+        .iter()
+        .map(|band| {
+            physical_to_raw_exact(0.0, band).map(|raw| BandOmit {
+                stored: vec![raw],
+                physical: vec![0.0],
+            })
+        })
+        .collect()
+}
+
+/// Resolves `--omit-class` output values into quantized class indices.
+pub(crate) fn resolve_class_omits(
+    args: &[String],
     quantize: &[Option<BandQuantize>],
     band_specs: &[BandSpec],
 ) -> Result<Vec<Option<BandOmit>>> {
-    let mut requested: Vec<Vec<(f64, bool)>> = vec![Vec::new(); band_specs.len()];
-    if omit_zero {
-        for entry in requested.iter_mut() {
-            entry.push((0.0, false));
-        }
-    }
+    let mut requested: Vec<Vec<f64>> = vec![Vec::new(); band_specs.len()];
     for arg in args {
-        let (band_name, entries) = split_band_prefix_for(arg, band_specs, "--omit")?;
+        let (band_name, entries) = split_band_prefix_for(arg, band_specs, "--omit-class")?;
         let index = band_specs
             .iter()
             .position(|band| band.name == band_name)
             .with_context(|| {
                 format!(
-                    "unknown band {band_name:?} in --omit; this product has {}",
+                    "unknown band {band_name:?} in --omit-class; this product has {}",
                     band_choices(band_specs)
                 )
             })?;
         for entry in entries.split(',') {
-            requested[index].push((parse_number(entry)?, true));
+            requested[index].push(parse_number(entry)?);
         }
     }
 
@@ -292,60 +304,41 @@ pub(crate) fn resolve_omits(
             continue;
         }
         let band = &band_specs[index];
+        let quantize = quantize[index].as_ref().with_context(|| {
+            format!(
+                "--omit-class for band {:?} requires --quantize for that band",
+                band.name
+            )
+        })?;
         let mut stored = Vec::new();
         let mut physical = Vec::new();
-        for (value, strict) in wanted {
-            let mapped = match &quantize[index] {
-                // A quantized band stores class indices, so omit every class
-                // that emits this value.
-                Some(quantize) => {
-                    let classes = quantize.classes_emitting(value);
-                    if classes.is_empty() && strict {
-                        let available = quantize
-                            .outputs()
-                            .iter()
-                            .map(|output| output.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        bail!(
-                            "--omit value {value} is not one of the classes of band \
-                             {:?}; it emits {available}",
-                            band.name
-                        );
-                    }
-                    classes
-                }
-                // Without quantization the point carries the raw value, so the
-                // requested value has to land exactly on the raw grid.
-                None => match physical_to_raw_exact(value, band) {
-                    Some(raw) => vec![raw],
-                    None if strict => bail!(
-                        "--omit value {value} does not exist in band {:?}: it falls between \
-                         two representable values",
-                        band.name
-                    ),
-                    None => Vec::new(),
-                },
-            };
-            if !mapped.is_empty() {
-                physical.push(value);
-                stored.extend(mapped);
+        for value in wanted {
+            let classes = quantize.classes_emitting(value);
+            if classes.is_empty() {
+                let available = quantize
+                    .outputs()
+                    .iter()
+                    .map(|output| output.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "--omit-class value {value} is not one of the classes of band \
+                     {:?}; it emits {available}",
+                    band.name
+                );
             }
+            physical.push(value);
+            stored.extend(classes);
         }
-        if stored.is_empty() {
-            continue;
-        }
-        if let Some(quantize) = &quantize[index] {
-            let distinct = stored
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            ensure!(
-                distinct < quantize.class_count(),
-                "--omit would drop every class of band {:?}",
-                band.name
-            );
-        }
+        let distinct = stored
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        ensure!(
+            distinct < quantize.class_count(),
+            "--omit-class would drop every class of band {:?}",
+            band.name
+        );
         stored.sort_unstable();
         stored.dedup();
         omits[index] = Some(BandOmit { stored, physical });
@@ -353,8 +346,8 @@ pub(crate) fn resolve_omits(
     Ok(omits)
 }
 
-/// Checks `--omit` syntax without needing the band specs.
-pub(crate) fn validate_omit_syntax(args: &[String]) -> Result<()> {
+/// Checks `--omit-class` syntax without needing the band specs.
+pub(crate) fn validate_omit_class_syntax(args: &[String]) -> Result<()> {
     for arg in args {
         let entries = match arg.split_once('=') {
             Some((_, entries)) => entries,
@@ -536,23 +529,19 @@ mod tests {
         );
     }
 
-    fn omits_for(
-        spec: Option<&str>,
+    fn class_omits_for(
+        spec: &str,
         omit: &[&str],
-        omit_zero: bool,
         bands: &[BandSpec],
     ) -> Result<Vec<Option<BandOmit>>> {
-        let quantize = match spec {
-            Some(spec) => resolve(&[spec.to_string()], bands)?,
-            None => vec![None; bands.len()],
-        };
+        let quantize = resolve(&[spec.to_string()], bands)?;
         let args = omit.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-        resolve_omits(&args, omit_zero, &quantize, bands)
+        resolve_class_omits(&args, &quantize, bands)
     }
 
     #[test]
     fn omitting_a_class_covers_only_that_class() {
-        let omits = omits_for(Some("0:0,1:1,2:2"), &["0"], false, &[band("value")]).unwrap();
+        let omits = class_omits_for("0:0,1:1,2:2", &["0"], &[band("value")]).unwrap();
         let omit = omits[0].as_ref().unwrap();
 
         assert!(omit.contains(0));
@@ -563,14 +552,14 @@ mod tests {
 
     #[test]
     fn nothing_is_omitted_without_the_options() {
-        let omits = omits_for(Some("0,1,2"), &[], false, &[band("value")]).unwrap();
+        let omits = class_omits_for("0,1,2", &[], &[band("value")]).unwrap();
 
         assert!(omits[0].is_none());
     }
 
     #[test]
     fn several_values_can_be_omitted_at_once() {
-        let omits = omits_for(Some("0:0,1:1,2:2"), &["0,2"], false, &[band("value")]).unwrap();
+        let omits = class_omits_for("0:0,1:1,2:2", &["0,2"], &[band("value")]).unwrap();
         let omit = omits[0].as_ref().unwrap();
 
         assert!(omit.contains(0) && omit.contains(2));
@@ -579,7 +568,7 @@ mod tests {
 
     #[test]
     fn omitting_a_value_that_is_not_a_class_is_rejected() {
-        let error = omits_for(Some("0:0,1:1"), &["5"], false, &[band("value")]).unwrap_err();
+        let error = class_omits_for("0:0,1:1", &["5"], &[band("value")]).unwrap_err();
 
         let message = format!("{error:#}");
         assert!(message.contains("not one of the classes"), "got: {message}");
@@ -591,48 +580,44 @@ mod tests {
 
     #[test]
     fn omitting_every_class_is_rejected() {
-        let error = omits_for(Some("0:0,1:1"), &["0,1"], false, &[band("value")]).unwrap_err();
+        let error = class_omits_for("0:0,1:1", &["0,1"], &[band("value")]).unwrap_err();
 
         assert!(error.to_string().contains("every class"), "got: {error:#}");
     }
 
     #[test]
-    fn omit_works_without_quantization_by_matching_the_raw_value() {
-        // decimal_scale 1 means raw 7 is the physical value 0.7.
-        let omits = omits_for(None, &["0.7"], false, &[scaled_band("value", 1)]).unwrap();
-        let omit = omits[0].as_ref().unwrap();
+    fn omit_class_requires_quantization() {
+        let error = resolve_class_omits(&["0".to_string()], &[None], &[band("value")]).unwrap_err();
 
-        assert!(omit.contains(7));
-        assert!(!omit.contains(6));
-    }
-
-    #[test]
-    fn omit_rejects_a_value_between_two_representable_ones() {
-        // With decimal_scale 0 the grid is whole units, so 0.5 cannot occur.
-        let error = omits_for(None, &["0.5"], false, &[band("value")]).unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains("falls between"),
-            "got: {error:#}"
-        );
+        assert!(error.to_string().contains("requires --quantize"));
     }
 
     #[test]
     fn omit_zero_applies_to_every_band() {
         let bands = [band("u"), band("v")];
 
-        let omits = omits_for(None, &[], true, &bands).unwrap();
+        let omits = resolve_zero_omits(true, &bands);
 
         assert!(omits[0].as_ref().unwrap().contains(0));
         assert!(omits[1].as_ref().unwrap().contains(0));
     }
 
     #[test]
-    fn omit_zero_is_a_no_op_when_no_class_emits_zero() {
-        // Unlike --omit, the blanket flag must not fail here.
-        let omits = omits_for(Some("1:1,2:2"), &[], true, &[band("value")]).unwrap();
+    fn omit_zero_is_independent_of_quantized_outputs() {
+        let omits = resolve_zero_omits(true, &[band("value")]);
 
-        assert!(omits[0].is_none());
+        assert!(omits[0].as_ref().unwrap().contains(0));
+    }
+
+    #[test]
+    fn omit_zero_is_a_no_op_when_physical_zero_is_not_representable() {
+        let band = BandSpec {
+            name: "value".to_string(),
+            reference_value: 0.5,
+            ..Default::default()
+        };
+
+        assert!(resolve_zero_omits(true, &[band])[0].is_none());
     }
 
     #[test]
