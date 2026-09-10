@@ -41,14 +41,14 @@ struct Cli {
     max_zoom: Option<u8>,
 
     /// Drop products that are analyses rather than forecasts. Nowcast inputs
-    /// lead with the observed field, whose valid time is before the reference
-    /// time, which otherwise becomes the first layer.
+    /// lead with the observed field, valid at the reference time itself, which
+    /// otherwise becomes the first layer.
     #[arg(long)]
     skip_analysis: bool,
 
     /// Keep only products at least this many minutes ahead of the reference
-    /// time. The first nowcast step is valid at the reference time itself, so
-    /// --min-lead-time 5 starts the layers at the first real forecast.
+    /// time. The observed field of a nowcast is valid at the reference time, so
+    /// --min-lead-time 5 starts the layers at the first forecast step.
     #[arg(long, value_name = "MINUTES")]
     min_lead_time: Option<i64>,
 

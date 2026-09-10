@@ -774,8 +774,8 @@ fn select_products<T: IdentifiedProduct>(
     products.retain(|product| product_selector(product) == selected_product);
 
     if let Some(minutes) = min_lead_time {
-        // The first nowcast step is valid at the reference time itself, so a
-        // lead time floor is what separates "now" from the actual forecasts.
+        // A nowcast's observed field is valid at the reference time itself, so
+        // a lead time floor is what separates "now" from the forecasts.
         let before = products.len();
         products.retain(|product| {
             let product_id = product.product_id();
@@ -793,9 +793,9 @@ fn select_products<T: IdentifiedProduct>(
     }
 
     if skip_analysis {
-        // Nowcast inputs lead with the observed field, whose valid time is
-        // before the reference time. Dropping it here, ahead of the layer count,
-        // keeps the numbering aligned with the forecast steps.
+        // Nowcast inputs lead with the observed field, valid at the reference
+        // time itself. Dropping it here, ahead of the layer count, keeps the
+        // numbering aligned with the forecast steps.
         let before = products.len();
         products.retain(|product| {
             product.product_id().generating_process != GeneratingProcessType::Analysis
@@ -1428,51 +1428,53 @@ mod tests {
 
     #[test]
     fn the_analysis_leads_the_layers_by_default() {
-        // A nowcast input starts with the observed field, five minutes back.
+        // A nowcast input starts with the observed field. It accumulates over
+        // the five minutes ending at the reference time, so it is valid then -
+        // the same instant the first forecast step covers the start of.
         let input = vec![
-            product(-5, GeneratingProcessType::Analysis),
-            product(0, GeneratingProcessType::Forecast),
+            product(0, GeneratingProcessType::Analysis),
             product(5, GeneratingProcessType::Forecast),
+            product(10, GeneratingProcessType::Forecast),
         ];
 
         let selected = select_products(input, None, None, false, None).unwrap();
 
-        assert_eq!(offsets(&selected), [-5, 0, 5]);
+        assert_eq!(offsets(&selected), [0, 5, 10]);
     }
 
     #[test]
     fn skip_analysis_drops_the_observed_field() {
         let input = vec![
-            product(-5, GeneratingProcessType::Analysis),
-            product(0, GeneratingProcessType::Forecast),
+            product(0, GeneratingProcessType::Analysis),
             product(5, GeneratingProcessType::Forecast),
+            product(10, GeneratingProcessType::Forecast),
         ];
 
         let selected = select_products(input, None, None, true, None).unwrap();
 
-        assert_eq!(offsets(&selected), [0, 5]);
+        assert_eq!(offsets(&selected), [5, 10]);
     }
 
     #[test]
     fn skip_analysis_runs_before_the_layer_count() {
         // The count must apply to the forecasts, not include the analysis.
         let input = vec![
-            product(-5, GeneratingProcessType::Analysis),
-            product(0, GeneratingProcessType::Forecast),
+            product(0, GeneratingProcessType::Analysis),
             product(5, GeneratingProcessType::Forecast),
+            product(10, GeneratingProcessType::Forecast),
         ];
 
         let selected = select_products(input, None, Some(2), true, None).unwrap();
 
-        assert_eq!(offsets(&selected), [0, 5]);
+        assert_eq!(offsets(&selected), [5, 10]);
     }
 
     #[test]
-    fn min_lead_time_also_drops_the_step_valid_at_the_reference_time() {
-        // The first nowcast forecast is valid at the reference time itself.
+    fn min_lead_time_also_drops_the_observed_field() {
+        // The observed field is valid at the reference time, so a floor of one
+        // step removes it without needing to know it is an analysis.
         let input = vec![
-            product(-5, GeneratingProcessType::Analysis),
-            product(0, GeneratingProcessType::Forecast),
+            product(0, GeneratingProcessType::Analysis),
             product(5, GeneratingProcessType::Forecast),
             product(10, GeneratingProcessType::Forecast),
         ];
@@ -1496,7 +1498,7 @@ mod tests {
 
     #[test]
     fn skip_analysis_reports_an_input_with_no_forecast() {
-        let input = vec![product(-5, GeneratingProcessType::Analysis)];
+        let input = vec![product(0, GeneratingProcessType::Analysis)];
 
         let error = select_products(input, None, None, true, None).unwrap_err();
 

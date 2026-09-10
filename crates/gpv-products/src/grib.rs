@@ -12,7 +12,8 @@ use tinygrib2::{
         DataRepresentationTemplate5_200, GridDefinitionTemplate3_0, ProductDefinitionTemplate4_0,
         ProductDefinitionTemplate4_1, ProductDefinitionTemplate4_8, ProductDefinitionTemplate4_11,
         ProductDefinitionTemplate4_50000, ProductDefinitionTemplate4_50011,
-        ProductDefinitionTemplate4_50031, read_data_7_0, read_data_7_3, read_data_7_200,
+        ProductDefinitionTemplate4_50031, TimeInterval, read_data_7_0, read_data_7_3,
+        read_data_7_200,
     },
 };
 
@@ -113,6 +114,78 @@ struct GridCorner {
     x: u32,
     y: u32,
     snap: Option<(u32, u32)>,
+}
+
+/// The statistical operation the first time range describes.
+///
+/// A statistical template promises at least one range; indexing straight into
+/// the list turns a truncated message into a panic instead of a report.
+fn first_statistical_process(interval: &TimeInterval) -> tinygrib2::Result<u8> {
+    interval
+        .time_ranges
+        .first()
+        .map(|range| range.statistical_process)
+        .ok_or_else(|| {
+            tinygrib2::Error::InvalidData("a statistical product carries no time range".to_string())
+        })
+}
+
+/// When a field is valid.
+///
+/// A statistical product covers a period rather than an instant, and GRIB2
+/// spells out where that period ends: `forecast_time` marks only where it
+/// begins. Reading the start instead placed every accumulated product a whole
+/// period early - an hour for the short-range forecasts, five minutes for the
+/// nowcasts - so the choice between the two is made here, once, where it can be
+/// tested.
+///
+/// See templates 4.8 and 4.11: the forecast time is the start of the overall
+/// interval, and the explicit date is its end.
+fn valid_datetime(
+    reference_datetime: DateTime<Utc>,
+    template: &ProductDefinitionTemplate4_0,
+    interval: Option<&TimeInterval>,
+) -> tinygrib2::Result<DateTime<Utc>> {
+    if let Some(interval) = interval {
+        // Present but unreadable is not the same as absent. Falling back to the
+        // start of the period would give a plausible time that is quietly an
+        // accumulation period wrong, which nothing downstream could detect.
+        return Utc
+            .with_ymd_and_hms(
+                i32::from(interval.year),
+                u32::from(interval.month),
+                u32::from(interval.day),
+                u32::from(interval.hour),
+                u32::from(interval.minute),
+                u32::from(interval.second),
+            )
+            .single()
+            .ok_or_else(|| {
+                tinygrib2::Error::InvalidData(format!(
+                    "the statistical period ends at {}-{:02}-{:02} {:02}:{:02}:{:02}, \
+                     which is not a valid time",
+                    interval.year,
+                    interval.month,
+                    interval.day,
+                    interval.hour,
+                    interval.minute,
+                    interval.second
+                ))
+            });
+    }
+
+    let offset = i64::from(template.forecast_time);
+    Ok(reference_datetime
+        + match template.indicator_of_unit_of_time_range {
+            0 => Duration::minutes(offset),
+            1 => Duration::hours(offset),
+            2 => Duration::days(offset),
+            unit => {
+                return Err(tinygrib2::Error::UnsupportedData(format!(
+                    "time range unit {unit} is not supported"
+                )));
+            }
+        })
 }
 
 fn grid_corner(
@@ -254,8 +327,8 @@ pub struct GridSquareMessageReader {
     current_drs: Option<DataRepresentationSectionHeader>,
     current_drs_tmpl: Option<DataRepresentationTemplate>,
     current_bitmap: Option<BitVec>,
-    retained_product: Option<String>,
     warned_grid_snap: bool,
+    retained_product: Option<String>,
     pub products: HashMap<GpvProductIdentifier, ProductData>,
     /// Track latest reference_datetime for each kind path
     pub latest_reference_times: HashMap<String, DateTime<Utc>>,
@@ -361,6 +434,9 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
                 0,
             )
         } else {
+            // Set by the statistical templates, which carry the period their
+            // field covers.
+            let mut interval_end: Option<TimeInterval> = None;
             let (tmpl0, statistical_process, ensemble) = match pds.template_number {
                 0 | 50000 => {
                     let tmpl0 = match pds.template_number {
@@ -375,7 +451,8 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
                         1 => (ProductDefinitionTemplate4_1::read(reader)?, None),
                         11 => {
                             let tmpl11 = ProductDefinitionTemplate4_11::read(reader)?;
-                            let stat_process = tmpl11.interval.time_ranges[0].statistical_process;
+                            let stat_process = first_statistical_process(&tmpl11.interval)?;
+                            interval_end = Some(tmpl11.interval);
                             (tmpl11.template_1, Some(stat_process))
                         }
                         _ => unreachable!(),
@@ -393,20 +470,13 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
                         _ => unreachable!(),
                     };
                     let tmpl0 = tmpl8.template_0;
-                    (
-                        tmpl0,
-                        Some(tmpl8.interval.time_ranges[0].statistical_process),
-                        None,
-                    )
+                    let stat_process = first_statistical_process(&tmpl8.interval)?;
+                    interval_end = Some(tmpl8.interval);
+                    (tmpl0, Some(stat_process), None)
                 }
                 _ => unreachable!("template 4.{:#?} is not supported yet", pds.template_number),
             };
-            let datetime = match tmpl0.indicator_of_unit_of_time_range {
-                0 => reference_datetime + Duration::minutes(tmpl0.forecast_time as i64),
-                1 => reference_datetime + Duration::hours(tmpl0.forecast_time as i64),
-                2 => reference_datetime + Duration::days(tmpl0.forecast_time as i64),
-                v => unimplemented!("{}", v),
-            };
+            let datetime = valid_datetime(reference_datetime, &tmpl0, interval_end.as_ref())?;
             let gds_tmpl: &GridDefinitionTemplate3_0 = self.current_gds_tmpl.as_ref().unwrap();
             get_product_id_and_band(
                 &tmpl0,
@@ -844,6 +914,123 @@ mod tests {
             error
                 .to_string()
                 .contains("cell width 3 is not a power of two")
+        );
+    }
+
+    fn interval(year: u16, month: u8, day: u8, hour: u8, minute: u8) -> TimeInterval {
+        TimeInterval {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second: 0,
+            time_ranges: vec![tinygrib2::templates::TimeRange {
+                total_number_of_data_values_missing: 0,
+                statistical_process: 1,
+                type_of_time_increment: 2,
+                indicator_of_unit_of_time: 0,
+                length_of_the_time_range: 60,
+                indicator_of_unit_of_length_of_time_range: 0,
+                time_increment: 0,
+            }],
+        }
+    }
+
+    fn forecast_template(forecast_time: i32, unit: u8) -> ProductDefinitionTemplate4_0 {
+        ProductDefinitionTemplate4_0 {
+            parameter_category: 1,
+            parameter_number: 8,
+            type_of_generating_process: 2,
+            background_process: 0,
+            generating_process_identifier: 0,
+            hours_after_data_cutoff: 0,
+            minutes_after_data_cutoff: 0,
+            indicator_of_unit_of_time_range: unit,
+            forecast_time,
+            type_of_first_fixed_surface: 1,
+            scale_factor_of_first_fixed_surface: 0,
+            scaled_value_of_first_fixed_surface: 0,
+            type_of_second_fixed_surface: 255,
+            scale_factor_of_second_fixed_surface: 0,
+            scaled_value_of_second_fixed_surface: 0,
+        }
+    }
+
+    /// The two ways a valid time can be reached, chosen by whether the product
+    /// covers a period. Testing the conversion alone let the caller go back to
+    /// reading `forecast_time` without anything failing.
+    #[test]
+    fn a_period_ends_the_field_but_an_instant_is_offset_from_the_reference() {
+        let reference = Utc.with_ymd_and_hms(2019, 10, 12, 9, 0, 0).unwrap();
+
+        // A one-hour accumulation whose period runs 09:00-10:00 is valid at
+        // 10:00, which is what `FH01` in the file name means. The forecast time
+        // marks the start and must not be used.
+        let accumulation = interval(2019, 10, 12, 10, 0);
+        assert_eq!(
+            valid_datetime(reference, &forecast_template(0, 0), Some(&accumulation)).unwrap(),
+            Utc.with_ymd_and_hms(2019, 10, 12, 10, 0, 0).unwrap()
+        );
+        // The last message of the same file: period 14:00-15:00, so +6h.
+        assert_eq!(
+            valid_datetime(
+                reference,
+                &forecast_template(300, 0),
+                Some(&interval(2019, 10, 12, 15, 0))
+            )
+            .unwrap(),
+            Utc.with_ymd_and_hms(2019, 10, 12, 15, 0, 0).unwrap()
+        );
+
+        // An instantaneous product has no period, and is offset from the
+        // reference by its forecast time.
+        assert_eq!(
+            valid_datetime(reference, &forecast_template(30, 0), None).unwrap(),
+            Utc.with_ymd_and_hms(2019, 10, 12, 9, 30, 0).unwrap()
+        );
+        assert_eq!(
+            valid_datetime(reference, &forecast_template(6, 1), None).unwrap(),
+            Utc.with_ymd_and_hms(2019, 10, 12, 15, 0, 0).unwrap()
+        );
+        assert_eq!(
+            valid_datetime(reference, &forecast_template(2, 2), None).unwrap(),
+            Utc.with_ymd_and_hms(2019, 10, 14, 9, 0, 0).unwrap()
+        );
+    }
+
+    /// A period that cannot be read is not the same as no period at all.
+    /// Falling back to the forecast time would hand back a plausible time that
+    /// is quietly a whole accumulation period wrong.
+    #[test]
+    fn an_unreadable_period_is_reported_rather_than_replaced() {
+        let reference = Utc.with_ymd_and_hms(2019, 10, 12, 9, 0, 0).unwrap();
+        let broken = interval(2019, 13, 40, 25, 0);
+
+        let error = valid_datetime(reference, &forecast_template(0, 0), Some(&broken)).unwrap_err();
+        assert!(
+            matches!(error, tinygrib2::Error::InvalidData(_)),
+            "expected InvalidData, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_time_unit_is_reported_rather_than_panicking() {
+        let reference = Utc.with_ymd_and_hms(2019, 10, 12, 9, 0, 0).unwrap();
+        let error = valid_datetime(reference, &forecast_template(1, 13), None).unwrap_err();
+        assert!(matches!(error, tinygrib2::Error::UnsupportedData(_)));
+    }
+
+    /// A statistical template promises a time range; a truncated one used to
+    /// index straight into an empty list.
+    #[test]
+    fn a_statistical_product_without_a_time_range_is_reported() {
+        let mut empty = interval(2019, 10, 12, 10, 0);
+        empty.time_ranges.clear();
+        assert!(first_statistical_process(&empty).is_err());
+        assert_eq!(
+            first_statistical_process(&interval(2019, 10, 12, 10, 0)).unwrap(),
+            1
         );
     }
 
