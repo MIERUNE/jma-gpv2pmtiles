@@ -830,7 +830,7 @@ dependencies = [
 [[package]]
 name = "tinygrib2"
 version = "0.1.0"
-source = "git+https://github.com/MIERUNE/tinygrib2.git#37f4ee2bca4205bf08a645be9378af1bc56ec705"
+source = "git+https://github.com/ciscorn/tinygrib2.git#bd724c961d6de91bdae0d01adb7ae61730fc7a13"
 dependencies = [
  "bitstream-io",
  "byteorder",

@@ -10,5 +10,5 @@ bit-vec = "0.9.1"
 chrono = "0.4.45"
 foldhash = "0.2.0"
 itertools = "0.14.0"
-tinygrib2 = { git = "https://github.com/MIERUNE/tinygrib2.git" }
+tinygrib2 = { git = "https://github.com/ciscorn/tinygrib2.git" }
 tracing = "0.1.44"
