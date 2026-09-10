@@ -113,7 +113,6 @@ fn resolve_product_grid(
 struct GridCorner {
     x: u32,
     y: u32,
-    snap: Option<(u32, u32)>,
 }
 
 /// The statistical operation the first time range describes.
@@ -194,12 +193,14 @@ fn grid_corner(
     grid: &LngLatGrid,
     width: u32,
 ) -> tinygrib2::Result<GridCorner> {
-    let longitude = (template.lo1 as f64 + 1. - MICRODEGREES_PER_DEGREE * grid.lng_0)
-        * f64::from(grid.lng_denom)
-        / MICRODEGREES_PER_DEGREE;
-    let latitude = (template.la1 as f64 + 1. - MICRODEGREES_PER_DEGREE * grid.lat_0)
-        * f64::from(grid.lat_denom)
-        / MICRODEGREES_PER_DEGREE;
+    // Distance from the base grid's first cell to the product's first cell,
+    // measured centre to centre - both origins name a cell centre.
+    let centre = |first: i32, origin: f64, denominator: f32| {
+        (f64::from(first) + 1. - MICRODEGREES_PER_DEGREE * origin) * f64::from(denominator)
+            / MICRODEGREES_PER_DEGREE
+    };
+    let longitude = centre(template.lo1, grid.lng_0, grid.lng_denom);
+    let latitude = centre(template.la1, grid.lat_0, grid.lat_denom);
     if longitude < 0. || latitude < 0. {
         return Err(unsupported_grid(
             product_id,
@@ -208,17 +209,32 @@ fn grid_corner(
         ));
     }
 
-    let (x_first, y_last) = (longitude as i64, latitude as i64);
-    let (x_aligned, y_aligned) = (
-        x_first - x_first % i64::from(width),
-        y_last - y_last % i64::from(width),
-    );
-    let snap = (x_aligned != x_first || y_aligned != y_last)
-        .then_some(((x_first - x_aligned) as u32, (y_last - y_aligned) as u32));
+    // A cell `width` base cells across has its centre half a cell in from
+    // where it starts, so the index of its leading edge is that much lower.
+    // Comparing the centre against a rule meant for an edge made every
+    // half-integer look misaligned; the products land squarely on the base
+    // grid once the two are expressed the same way.
+    let lead = f64::from(width - 1) / 2.;
+    let (x_first, y_last) = (longitude - lead, latitude - lead);
+
+    let index = |edge: f64| {
+        let cells = edge / f64::from(width);
+        (cells - cells.round()).abs() < GRID_TOLERANCE
+    };
+    if !index(x_first) || !index(y_last) {
+        return Err(unsupported_grid(
+            product_id,
+            template,
+            format!(
+                "its leading edge ({x_first}, {y_last}) in base cells is not a multiple of the \
+                 cell width {width}"
+            ),
+        ));
+    }
+
     Ok(GridCorner {
-        x: x_aligned as u32,
-        y: y_aligned as u32,
-        snap,
+        x: x_first.round() as u32,
+        y: y_last.round() as u32,
     })
 }
 
@@ -327,7 +343,6 @@ pub struct GridSquareMessageReader {
     current_drs: Option<DataRepresentationSectionHeader>,
     current_drs_tmpl: Option<DataRepresentationTemplate>,
     current_bitmap: Option<BitVec>,
-    warned_grid_snap: bool,
     retained_product: Option<String>,
     pub products: HashMap<GpvProductIdentifier, ProductData>,
     /// Track latest reference_datetime for each kind path
@@ -650,17 +665,6 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
             let width = grid_cell_width(&self.current_product_id, gds_tmpl, &grid)?;
             let power = width.ilog2() as u8;
             let corner = grid_corner(&self.current_product_id, gds_tmpl, &grid, width)?;
-            if let Some((x_shift, y_shift)) = corner.snap
-                && !self.warned_grid_snap
-            {
-                self.warned_grid_snap = true;
-                tracing::warn!(
-                    product = %self.current_product_id.path(),
-                    width,
-                    shift = format!("({x_shift}, {y_shift}) base cells"),
-                    "grid corner is not a multiple of the cell width; snapping this product's grids west and south"
-                );
-            }
             validate_grid_extent(
                 &self.current_product_id,
                 gds_tmpl,
@@ -838,68 +842,49 @@ mod tests {
     /// A corner that does not sit on a cell boundary is snapped visibly rather
     /// than being shifted with no diagnostic.
     #[test]
-    fn a_corner_off_the_cell_boundary_is_snapped_and_reported() {
-        // A 0.05 degree base grid, so a 0.1 degree product has width 2 and
-        // needs an even corner.
+    fn a_corner_is_read_as_a_cell_centre_and_checked_on_its_leading_edge() {
+        // The real nowcast grid: a base mesh of 1/320 by 1/480 degrees whose
+        // origin names the centre of its first cell, carrying a product whose
+        // cells are four base cells across.
         let base = LngLatGrid {
-            lng_0: 120.,
-            lat_0: 20.,
-            lng_denom: 20.,
-            lat_denom: 20.,
+            lng_0: 120. + 1. / 320. / 2.,
+            lat_0: 20. + 1. / 480. / 2.,
+            lng_denom: 320.,
+            lat_denom: 480.,
         };
         let corner = |lo1, la1| {
-            let mut template = grid_template(100_000, 100_000);
+            let mut template = grid_template(12_500, 8_333);
             template.lo1 = lo1;
             template.la1 = la1;
             template
         };
         let product_id = lfm_isobaric_wind();
 
-        // 120.00 and 20.00 are two cells from the origin: aligned.
-        let even = corner(120_000_000 - 1, 20_000_000 - 1);
+        // The values a real message carries. Centre to centre this is 6401.5
+        // base cells, a half-integer, because the product's cell centre sits
+        // one and a half base cells past the base grid's own. Its leading edge
+        // is 6400, squarely on the four-cell grid - so this has to be accepted,
+        // and it used to look misaligned.
+        let real = corner(140_006_250, 46_662_500);
         assert_eq!(
-            grid_corner(&product_id, &even, &base, 2).unwrap(),
-            GridCorner {
-                x: 0,
-                y: 0,
-                snap: None,
-            }
-        );
-        let further = corner(120_100_000 - 1, 20_100_000 - 1);
-        assert_eq!(
-            grid_corner(&product_id, &further, &base, 2).unwrap(),
-            GridCorner {
-                x: 2,
-                y: 2,
-                snap: None,
-            }
+            grid_corner(&product_id, &real, &base, 4).unwrap(),
+            GridCorner { x: 6400, y: 12796 }
         );
 
-        // 120.05 is one base cell in, which a width-2 grid cannot start on.
-        // It is snapped down rather than refused, because a supported product
-        // lands here; the snap is what the warning reports.
-        let odd = corner(120_050_000 - 1, 20_000_000 - 1);
-        assert_eq!(
-            grid_corner(&product_id, &odd, &base, 2).unwrap(),
-            GridCorner {
-                x: 0,
-                y: 0,
-                snap: Some((1, 0)),
-            }
+        // One base cell east is a corner a four-cell grid cannot start on.
+        let off = corner(140_006_250 + 3_125, 46_662_500);
+        assert!(
+            grid_corner(&product_id, &off, &base, 4).is_err(),
+            "a leading edge of 6401 is not a multiple of 4"
         );
-        // At width 1 the same corner is exactly where it says it is.
-        assert_eq!(
-            grid_corner(&product_id, &odd, &base, 1).unwrap(),
-            GridCorner {
-                x: 1,
-                y: 0,
-                snap: None,
-            }
-        );
+        // Half a base cell east is off by half a cell whatever the width, so
+        // it is refused rather than rounded onto the nearest boundary.
+        let half = corner(140_006_250 + 1_562, 46_662_500);
+        assert!(grid_corner(&product_id, &half, &base, 4).is_err());
 
-        // A corner before the origin is still refused outright.
-        let before = corner(119_000_000 - 1, 20_000_000 - 1);
-        assert!(grid_corner(&product_id, &before, &base, 1).is_err());
+        // A corner before the origin is refused outright.
+        let before = corner(119_000_000, 46_662_500);
+        assert!(grid_corner(&product_id, &before, &base, 4).is_err());
     }
 
     #[test]
