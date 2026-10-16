@@ -54,8 +54,6 @@ cargo run --release -- input.grib2.bin.gz output.pmtiles \
 
 ### 例（降水強度の階級）
 
-以下は出力の柔軟性を検証するものであり、商用サービスの模倣を意図するものではありません。
-
 #### 気象庁ライク
 
 ```bash
@@ -63,11 +61,11 @@ cargo run --release -- input.grib2.bin.gz output.pmtiles \
 --omit-zero
 ```
 
-#### Yahoo! JAPANライク
+#### 別名や別の階級値を与える例
 
 ```bash
---rename value=DN \
---quantize "0:1,1:2,2:3,4:4,8:5,12:6,16:7,24:8,32:9,40:10,48:11,56:12,64:13,80:14" \
+--rename value=intensity \
+--quantize "0:1,1:2,5:3,10:4,20:5,30:6,50:7,80:8" \
 --omit-zero
 ```
 
